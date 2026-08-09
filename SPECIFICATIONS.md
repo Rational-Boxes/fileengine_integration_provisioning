@@ -3,9 +3,11 @@
 A standalone **AGPL** FastAPI service lane that implements the **embedding
 provisioning API surface** (§14.7 of the commercial embedding kit): a
 server-to-server API for an embedding application to **stand up and maintain the
-directory structures it needs** — standardized "project"/space folder trees with
-owners, roles, ACLs, and metadata already applied — so end users then simply
-operate within correctly-permissioned spaces.
+project spaces it needs** — standardized "project"/space folder trees with owners,
+roles, ACLs, metadata, **and per-space automation** (folder_actions bindings:
+webhooks, notify, sorter, review chains — each customized per project) already
+applied — so end users then simply operate within correctly-permissioned,
+correctly-wired spaces. It is a **rich setup API**, not a static folder clone.
 
 Follows the established FileEngine FastAPI service-lane conventions (as
 `folder_actions`, `discussion`, `convert_search_ai`, `bcf_service`): `src/` layout,
@@ -25,8 +27,9 @@ own per-tenant Postgres, Redis audit emission, loopback monitoring endpoints, an
 ```
 Integrator backend  ──(integration-service token, §14.2)──▶  Provisioning Service (:8100)
   "provision project X"                                         │
-                                                                ├─ own Postgres: templates + provisioned-space records (idempotency)
+                                                                ├─ own Postgres: templates + provisioned space/node/binding records (idempotency)
                                                                 ├─ gRPC to core as the integration principal (mkdir / grant / metadata)
+                                                                ├─ REST to folder_actions (:8099): per-space automation bindings (§7.1)
                                                                 └─ Redis: emit provisioning.* audit events
 Official SPA (admin) ──(admin JWT)──▶ template CRUD (System config → Provisioning)
 ```
@@ -96,6 +99,9 @@ without reading the registry DB:
 - `prov_templates: [template_id, ..] | "*"` — templates it may apply.
 - `prov_principals: [pattern, ..]` — role/claim patterns it may grant (e.g.
   `role:project:*`), never `system_admin`.
+- `prov_actions: [type, ..] | "*"` — folder_actions binding types it may configure
+  (`webhook · notify · sorter · move_review · raise_review`), and whether it may set
+  `secret`s. Absent ⇒ no automation setup permitted.
 Every request is checked against these ceilings **before** any core call; the core
 ACL check is the second, authoritative gate.
 
@@ -147,8 +153,12 @@ Owns its own database (`PROV_PG_*`, default DB `provisioning`), per-tenant schem
   `integration_id`, `tenant`, `template_id`, `version`, `space_uid` (core root uid),
   `params` JSONB, `status`, `created_at`, `last_applied_at`.
 - **`provisioned_node`** — template-path → core `uid` map for a space (so reconcile
-  is stable across runs and drift can be computed): `space_id`, `path`, `uid`,
-  `kind`, `created_at`.
+  is stable across runs, drift can be computed, and `${node:<path>}` references
+  resolve): `space_id`, `path`, `uid`, `kind`, `created_at`.
+- **`provisioned_binding`** — the space's automation map: `space_id`, `ref`,
+  `folder_uid`, `fa_binding_id` (folder_actions id), `type`, `config_hash`,
+  `secret_refs`, `created/updated_at`. Backs idempotent reconcile of actions and
+  drift detection; holds **no raw secrets** (§5.4).
 - **`apply_run`** — per-apply log (audit companion): `space_id`, `mode`, `dry_run`,
   `outcome`, `report` JSONB (per-node actions/warnings), `actor` (integration_id),
   `ts`.
@@ -158,39 +168,125 @@ the replica.
 
 ---
 
-## 5. Template model (declarative, versioned)
+## 5. Space blueprint (declarative, versioned) — structure **and** setup
 
-As specified in embedding-kit §14.7.1 — an admin-authored, versioned, parameterized
-description of a desired subtree, binding to **existing** roles/claims:
+A blueprint is **not** a static folder clone. It declares the full initial setup of
+a space — folder tree, ACLs, metadata, **and per-space automation** (folder_actions
+bindings: webhooks, notify, sorter, review chains) — driven by a **typed parameter
+schema** so each space/project is customized at apply time. Real setups differ per
+project: a webhook's **context data map** and callback URL, a **notify** action's
+recipients/template/subject, a sorter's classifier set, review reviewers — all are
+parameters supplied per space, not baked into the template.
 
+### 5.1 Parameter schema (`params`) — typed, validated per-space inputs
+Each declared param has a `type`, `required`, optional `default`/`description`, and
+constraints; apply/patch calls must satisfy it.
+- Types: `string · int · bool · url · enum · map · list · principal · ref · secret`.
+  - **`map`** carries structured per-space data — e.g. a **webhook context data
+    map** or a notify field set — injected verbatim.
+  - **`secret`** is **write-only pass-through**: forwarded to folder_actions'
+    encrypted store, never returned or persisted raw by provisioning (§5.4).
+  - **`principal`** must match the token's `prov_principals`; **`ref`** points at an
+    existing object (e.g. a `classifier_set_id`).
+- Referenced by `${param}` (scalars) or whole-value injection for `map`/`list`.
+- **`${node:<template-path>}`** — a **symbolic folder reference** resolved at apply
+  time to *this space's* freshly-minted folder UUID (§5.3). Any folder reference in
+  an action's config (sorter route destinations, `move_review` on_approved/on_rejected,
+  webhook `move_to`) MUST use this token — **never a literal UUID**, which would point
+  at another space or nothing.
+
+### 5.2 Structure (root / children / acls / metadata)
 ```jsonc
-{
-  "template_id": "project-standard",
-  "version": 3,
-  "params": ["project_code", "manager_role", "member_role"],
-  "root": {
-    "name": "${project_code}",
-    "metadata": { "type": "project", "code": "${project_code}" },
-    "acls": [
-      { "principal": "role:${manager_role}", "allow": ["r","w","d","m"] },
-      { "principal": "role:${member_role}",  "allow": ["r","w"] },
-      { "principal": "everyone",             "deny":  ["r"] }
-    ],
-    "children": [
-      { "name": "Documents" },
-      { "name": "Drawings", "children": [ { "name": "Superseded" } ] },
-      { "name": "Incoming", "acls": [ { "principal": "role:${member_role}", "allow": ["r","w"] } ] },
-      { "name": "Approved", "acls": [ { "principal": "role:${member_role}", "allow": ["r"] } ] }
-    ]
-  }
+"root": {
+  "name": "${project_code}",
+  "metadata": { "type": "project", "code": "${project_code}" },
+  "acls": [
+    { "principal": "role:${manager_role}", "allow": ["r","w","d","m"] },
+    { "principal": "role:${member_role}",  "allow": ["r","w"] },
+    { "principal": "everyone",             "deny":  ["r"] }
+  ],
+  "children": [
+    { "name": "Documents" },
+    { "name": "Drawings", "children": [ { "name": "Superseded" } ] },
+    { "name": "Incoming", "acls": [ { "principal": "role:${member_role}", "allow": ["r","w"] } ] },
+    { "name": "Approved", "acls": [ { "principal": "role:${member_role}", "allow": ["r"] } ] }
+  ]
 }
 ```
 - **Inheritance:** a child with no `acls` inherits the parent's (mirrors the core's
   `ACL_INHERIT`); a child may add/override. Permission keys reuse the platform ACL
   letter vocabulary (`r w d l u v b s m i …`).
-- **Validation** (`templates.py`): params referenced exist; principals match the
-  token's `prov_principals` at apply time; no cyclic/oversized trees (bounded depth
-  + node count); permission letters known.
+
+### 5.3 Automation (`actions`) — per-space folder_actions bindings
+Each entry creates a folder_actions binding on a folder in the tree (by template
+`path`/`ref`), with **parameterized** `config`. Types mirror folder_actions
+(`webhook · notify · sorter · move_review · raise_review`); binding-level
+`on_events` + `mime_types` apply. Every field is `${param}`-substitutable, so the
+same template yields per-project-distinct automation.
+
+```jsonc
+"actions": [
+  {
+    "ref": "callback-webhook",
+    "folder": "Incoming",
+    "type": "webhook",
+    "on_events": ["file.created","conversion.complete"],
+    "mime_types": ["application/pdf"],
+    "config": {
+      "url": "${callback_url}",              // per-project endpoint
+      "secret": "${callback_secret}",        // secret param -> folder_actions encrypts at rest
+      "context": "${webhook_context}"        // per-project CONTEXT DATA MAP injected verbatim
+    }
+  },
+  {
+    "ref": "approvals-notify",
+    "folder": "Approved",
+    "type": "notify",
+    "on_events": ["review.approved"],
+    "config": {
+      "recipients": "${notify_recipients}",  // per-project recipients (users/roles)
+      "template": "${notify_template}",       // per-project template ref
+      "fields": "${notify_context}"           // per-project notify context/merge data
+    }
+  },
+  {
+    "ref": "route-approved",
+    "folder": "Incoming",
+    "type": "move_review",
+    "on_events": ["review.approved","review.rejected"],
+    "config": {
+      "on_approved": "${node:Approved}",      // resolved to THIS space's Approved uid
+      "on_rejected": "${node:Incoming/Rejected}"
+    }
+  }
+]
+```
+- The **webhook context data map** and the **notify** specifics (recipients,
+  template, merge fields) are per-space `map`/`list`/`ref` params — each project's
+  automation carries its own routing/correlation/recipient data.
+- **Folder references are symbolic, not cloned.** Because each new space has **fresh
+  folder UUIDs**, every destination in an action config (move/sorter destinations,
+  webhook `move_to`) uses `${node:<path>}` and is resolved to the space's real UUID
+  at apply time (§7.1). A blueprint can therefore *never* be a verbatim clone of an
+  existing binding export — the UUIDs are space-specific and must be re-bound. This
+  is the core reason provisioning **orchestrates** folder_actions rather than copying.
+- Actions are created via folder_actions' API (§7.1); provisioning owns the mapping
+  `ref → (folder_uid, folder_actions binding id)` for idempotent reconcile.
+
+### 5.4 Secrets handling
+`secret` params (webhook secrets, tokens embedded in context) are **never persisted
+raw** by provisioning and **never returned** by read endpoints (redacted). They are
+forwarded once to folder_actions, which encrypts them at rest (its `secrets.py`).
+Provisioning stores only a reference + a hash for drift detection. Rotation goes
+through the setup API (§6.4), not by reading the old value.
+
+### 5.5 Validation (`templates.py` / `blueprint.py`)
+Referenced params exist and are typed; `principal` params ⊆ `prov_principals`;
+action `type` ∈ the token's `prov_actions`; **every `${node:<path>}` reference
+resolves to a folder declared in the tree** (else the blueprint is rejected — no
+dangling destinations); no cyclic/oversized trees (bounded depth + node count);
+permission letters and event names known; `config` shapes validated against each
+action type's schema (delegated to folder_actions' `/action-types` contract).
 
 ---
 
@@ -200,21 +296,26 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
 **integration-service token**; template routes require **admin**.
 
 ### 6.1 Spaces (integration-driven)
-- `POST /v1/provisioning/spaces` — apply a template (create/reconcile a space).
+- `POST /v1/provisioning/spaces` — apply a blueprint (create/reconcile a space:
+  folders + ACLs + metadata **+ automation**).
   Body: `{ template_id, version?, tenant, parent_uid?, params:{...}, external_id,
   mode?: "create"|"reconcile"|"enforce", dry_run?: bool }`.
+  - **`params`** supplies all per-space customization declared by the blueprint's
+    parameter schema (§5.1) — scalars, the webhook **context data map**, notify
+    recipients/template/fields, classifier refs, `secret` values, etc. Validated
+    against the schema; `secret`s are write-only (§5.4).
   - **Idempotent by `external_id`** (unique per tenant+integration): a repeat call
     returns the same space, never a duplicate. `parent_uid` defaults to the
     integration's scoped root (must be within `prov_roots`).
   - **`mode`:** `create` (fail if exists) · `reconcile` (default; create-missing,
-    additive, non-destructive) · `enforce` (also correct drifted ACLs/metadata to
-    match the template; never destructive to user content).
-  - **`dry_run:true`** → return the **plan** without applying.
+    additive, non-destructive) · `enforce` (also correct drifted ACLs/metadata **and
+    action config** to match the blueprint; never destructive to user content).
+  - **`dry_run:true`** → return the **plan** (folders + actions) without applying.
   - **Preconditions:** tenant valid in LDAP (§3.2) else `409 tenant_not_initialized`;
-    `tenant ∈ prov_tenants`; `template_id ∈ prov_templates`; `parent_uid ∈ prov_roots`.
-  - Response: `{ space_uid, external_id, template_id, version, status:"created"|
-    "reconciled"|"noop", nodes:[{path, uid, action:"created"|"existing"|"updated"}],
-    warnings:[...] }`.
+    `tenant ∈ prov_tenants`; `template_id ∈ prov_templates`; `parent_uid ∈ prov_roots`;
+    each action `type ∈ prov_actions`.
+  - Response: `{ space_uid, external_id, template_id, version, status, nodes:[{path,
+    uid, action}], actions:[{ref, folder_uid, binding_id, action}], warnings:[...] }`.
 - `GET /v1/provisioning/spaces?tenant=&external_id=&template_id=` — list within scope.
 - `GET /v1/provisioning/spaces/{space_uid}` — inspect: node map, applied
   template+version, and **drift** vs the current template.
@@ -236,7 +337,29 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
 - `DELETE /v1/provisioning/templates/{id}` — retire (existing spaces keep their
   applied version).
 
-### 6.3 Monitoring (loopback-only, unauthenticated)
+### 6.3 Per-space configuration & setup API (rich, post-provision customization)
+Beyond one-shot apply, a space's **automation config** is separately inspectable and
+adjustable per project — so an integrator can set/rotate a webhook's context map, a
+notify action's recipients, etc., without re-templating. All bounded by the token's
+`prov_actions`/`prov_principals` and the space's blueprint (only its declared action
+set may be tuned; adding arbitrary action types is not allowed unless the blueprint
+declares them optional).
+- `GET /v1/provisioning/spaces/{space_uid}/config` — the space's resolved
+  automation config: each action `ref`, its folder, bound `binding_id`, `type`,
+  `on_events`/`mime_types`, and current param **values with `secret`s redacted**.
+- `PATCH /v1/provisioning/spaces/{space_uid}/config` — update per-space param values
+  (e.g. `{ params: { webhook_context: {...}, notify_recipients: [...] } }`);
+  re-renders the affected bindings and pushes them to folder_actions. Non-destructive,
+  idempotent, reported per action.
+- `POST /v1/provisioning/spaces/{space_uid}/actions` — add a binding **from the
+  blueprint's declared (optional) action set** with per-space config.
+- `PATCH|DELETE /v1/provisioning/spaces/{space_uid}/actions/{ref}` — update / remove
+  a space's binding (scope-checked).
+- `POST /v1/provisioning/spaces/{space_uid}/secrets/{ref}` — set/rotate a `secret`
+  param for an action; forwarded to folder_actions' encrypted store, never persisted
+  raw here (§5.4).
+
+### 6.4 Monitoring (loopback-only, unauthenticated)
 `/healthz`, `/readyz`, `/poolz` bound to loopback / `PROV_MONITORING_ALLOW_IPS`,
 per the platform monitoring convention. Not on the public surface.
 
@@ -265,6 +388,33 @@ per the platform monitoring convention. Not on the public surface.
   `grant_permission`/`revoke_permission`, `set_metadata` — each ACL-checked by the
   core for the acting integration principal.
 
+### 7.1 folder_actions orchestration + node-reference resolution
+Automation (`actions`) is applied **after** the folder tree, in two steps:
+1. **Resolve `${node:<path>}` → real UUID.** Once the tree exists and the
+   `path → uid` map is persisted (`provisioned_node`), every folder reference in each
+   action's `config` — move/sorter destinations, webhook `move_to`, the binding's own
+   target folder — is resolved to *this space's* freshly-minted UUID. This is why a
+   blueprint can never clone a binding verbatim (§5.3): the UUIDs are space-specific.
+2. **Create/reconcile the binding via folder_actions' API** (`PROV_FOLDER_ACTIONS_URL`,
+   :8099) as the acting integration/admin token: `POST /actions` (create) or
+   `PUT /actions/{id}` (update) with the resolved, param-substituted config;
+   `PUT /actions/{id}/routes` for sorter routes (destinations resolved likewise).
+   Provisioning records `ref → (folder_uid, binding_id, config_hash)` in
+   `provisioned_binding` so reconcile is idempotent and drift is detectable.
+- **Reconcile/enforce:** re-resolve refs against the stable node map and diff each
+  binding's rendered config vs `config_hash`; `enforce` pushes corrections. Bindings
+  are created disabled→enabled last, so a half-applied space never fires actions.
+- **Secrets** in a binding config are handed to folder_actions (encrypted at rest,
+  its `secrets.py`); provisioning keeps only a reference + hash (§5.4).
+- **Cross-service failure** is reported per-action in the response; a folder_actions
+  outage leaves folders created and actions pending — a re-apply completes them
+  (idempotent). Folder writes and binding creation are **not** one transaction, so the
+  engine is designed to converge on retry rather than roll back.
+- **Boundary note:** configuring folder_actions here is the *programmatic
+  config-service* path (admin/server-to-server), the counterpart of the official
+  client's *interactive* folder_actions admin UI — both are admin surfaces; neither is
+  the end-user embed kit.
+
 ---
 
 ## 8. Audit (`audit.py` → Redis audit stream)
@@ -273,7 +423,9 @@ Emit to the platform audit stream (drained by `audit_service`) — tamper-eviden
 attributable. Events, each `{ integration_id, tenant, template_id, version,
 space_uid, external_id, mode, outcome, source_ip }`:
 - `provisioning.space_applied`, `provisioning.space_reconciled`,
-  `provisioning.space_deleted`, and (admin) `provisioning.template_changed`.
+  `provisioning.space_deleted`, `provisioning.action_configured` (binding
+  create/update, secret rotate — secrets redacted), and (admin)
+  `provisioning.template_changed`.
 Rejections (scope/authz failures) are emitted too, as security signals.
 
 ---
@@ -293,6 +445,8 @@ Service-private `PROV_*`:
 - Auth: `PROV_BRIDGE_URL` (+ `PROV_BRIDGE_INTROSPECT_TTL`) for the introspection
   fallback; `PROV_PROVISIONING_ROLE` (the role name used when acting as an
   integration principal on the core).
+- Orchestration: `PROV_FOLDER_ACTIONS_URL` (:8099) + `PROV_FOLDER_ACTIONS_TIMEOUT_S`
+  for applying per-space automation bindings (§7.1).
 - Limits: `PROV_MAX_TREE_NODES`, `PROV_MAX_TREE_DEPTH`, `PROV_APPLY_RATE_PER_MIN`
   (per `integration_id`), `PROV_ALLOW_SPACE_DELETE` (default false).
 - Monitoring: `PROV_MONITORING_ALLOW_IPS`.
@@ -371,11 +525,17 @@ Console scripts (`pyproject`): `provisioning-service = provisioning_service.app:
    integration/admin tokens), `python_interface` core client, per-tenant schema,
    `/healthz`. Boots against the dev stack.
 2. **P1 — Templates.** template CRUD (admin) + validation + versioning store.
-3. **P2 — Apply engine.** `POST /spaces` create + `reconcile`, idempotency by
-   `external_id`, node map, core mkdir/grant/metadata as the integration principal,
-   `provisioning.*` audit. The first usable release.
-4. **P3 — Enforce + drift + dry-run + grants + soft-delete.**
-5. **P4 — Hardening.** rate-limits, reconcile sweep, docs/examples (template
+3. **P2 — Apply engine (structure).** `POST /spaces` create + `reconcile`,
+   idempotency by `external_id`, node map, core mkdir/grant/metadata as the
+   integration principal, `provisioning.*` audit. First usable release (folders +
+   ACL + metadata).
+4. **P3 — Automation & setup (the rich part).** `actions` in the blueprint;
+   `${node:...}` resolution; folder_actions orchestration (§7.1) incl. sorter routes
+   + secrets; the per-space configuration/setup API (§6.3); `provisioned_binding`
+   store + reconcile. This is what makes provisioning more than a folder clone.
+5. **P4 — Enforce + drift + dry-run + grants + soft-delete** (over structure *and*
+   actions).
+6. **P5 — Hardening.** rate-limits, reconcile sweep, docs/examples (blueprint
    authoring + onboarding), unified-stack + Ansible packaging.
 
 Aligns with the embedding kit's **M-U (V1)**: this service is the concrete home of
@@ -395,3 +555,11 @@ the §14.7 provisioning surface.
    shared directory (v1), or add an optional "ensure these role bindings exist" hook
    later.
 4. **Space deletion**: ship `DELETE` (soft) in v1 or defer (default off).
+5. **Automation ownership model**: bindings a space owns are created/reconciled by
+   provisioning (default). Confirm whether the official folder_actions admin UI may
+   *also* edit those provisioned bindings (dual-writer → drift on next `enforce`), or
+   whether provisioned bindings are marked read-only/managed to avoid conflicting
+   edits.
+6. **Blueprint action set flexibility**: fixed per template (default) vs allowing the
+   setup API (§6.3) to add bindings from an "optional actions" allow-list the
+   blueprint declares. Affects how much post-provision customization is permitted.
