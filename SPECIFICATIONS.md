@@ -51,11 +51,13 @@ Official SPA (admin) ──(admin JWT)──▶ template CRUD (System config →
 idempotent project provisioning keyed by the integrator's `external_id`; drift
 inspection; scope enforcement; `provisioning.*` audit.
 
-**Does not:** manage identity. Creating roles/groups and managing membership stays
-in the shared LDAP source-of-truth (the integrator writes to the common directory,
-or uses ldap_manager admin) — templates *bind to* existing roles/claims, they don't
-create them. No end-user surface (the embed kit never calls this). No ACL-editing
-UI. No token minting (that's §14.2).
+**Does not:** manage identity or tenant lifecycle. Creating roles/groups and
+managing membership stays in the shared LDAP source-of-truth (the integrator writes
+to the common directory, or uses ldap_manager admin) — templates *bind to* existing
+roles/claims, they don't create them. **Tenants** are likewise defined by their LDAP
+OU structure (§3.2), initialized by the embedding application *before* FileEngine is
+touched; provisioning only validates + adopts them. No end-user surface (the embed
+kit never calls this). No ACL-editing UI. No token minting (that's §14.2).
 
 ---
 
@@ -96,6 +98,37 @@ without reading the registry DB:
   `role:project:*`), never `system_admin`.
 Every request is checked against these ceilings **before** any core call; the core
 ACL check is the second, authoritative gate.
+
+### 3.2 Tenant model — implicit & LDAP-driven (lazy bootstrap)
+
+The service has **no tenant-registration step**. A tenant is defined by its **OU
+structure in the shared LDAP directory** (`FILEENGINE_LDAP_TENANT_BASE`, e.g.
+`ou=<tenant>,ou=tenants,…`) — the source-of-truth (Posture B, embedding-kit §5.0).
+
+- **Prerequisite ordering (integrator's responsibility).** The embedding
+  application **MUST initialize the tenant's LDAP OU structure** (its users/roles
+  OUs per the shared schema) **before** touching FileEngine. FileEngine is
+  downstream of the directory; provisioning never creates the tenant *identity*.
+- **Validate → adopt → apply (per request).** For the request's tenant `T` (from
+  the token's tenant / `X-Tenant`, and it must be within `prov_tenants`):
+  1. **Validate** `T` against LDAP (`ldap_auth`): a well-formed tenant OU must exist
+     under the tenant base. Absent/malformed ⇒ reject **`409 tenant_not_initialized`**
+     (audited) — the integrator must init the LDAP OU first.
+  2. **Boot the tenant metadata:** load `T`'s config from the directory into the
+     service's tenant metadata (cached), and idempotently `ensure_tenant_schema` for
+     the provisioning DB.
+  3. **Core materializes `T` lazily** on the first write — `TenantManager.get_tenant_context`
+     creates the tenant's schema + storage on first access, so acting as the
+     integration principal against `T`'s root **auto-provisions** the core-side
+     tenant. No explicit `CreateTenant` call is needed.
+  4. Proceed with the apply (§7).
+- **No garbage tenants.** Step 1 gates on LDAP validity, so the service never
+  materializes a tenant the directory doesn't define: **the LDAP OU is the gate; the
+  core lazy-create is the mechanism.**
+- **Upstream note:** this relies only on the core's existing lazy tenant
+  materialization — no new tenant RPC required. If strict pre-materialization
+  (schema/storage without a first write) is ever wanted, a small admin "ensure
+  tenant" op could be added later; not needed for v1.
 
 ---
 
@@ -177,6 +210,8 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
     additive, non-destructive) · `enforce` (also correct drifted ACLs/metadata to
     match the template; never destructive to user content).
   - **`dry_run:true`** → return the **plan** without applying.
+  - **Preconditions:** tenant valid in LDAP (§3.2) else `409 tenant_not_initialized`;
+    `tenant ∈ prov_tenants`; `template_id ∈ prov_templates`; `parent_uid ∈ prov_roots`.
   - Response: `{ space_uid, external_id, template_id, version, status:"created"|
     "reconciled"|"noop", nodes:[{path, uid, action:"created"|"existing"|"updated"}],
     warnings:[...] }`.
@@ -209,6 +244,9 @@ per the platform monitoring convention. Not on the public surface.
 
 ## 7. Apply engine (`engine.py`) — semantics
 
+- **Resolve tenant first (§3.2).** Validate the request tenant against LDAP and boot
+  its metadata (reject `tenant_not_initialized` if the OU is absent); the core
+  materializes the tenant lazily on the first write. Only then plan/apply.
 - **Plan → apply.** Resolve the template version, substitute `params`, and compute
   a **plan**: the desired node tree + ACL/metadata. Diff against `provisioned_node`
   (existing map) + live core state to classify each node create/existing/updated.
