@@ -352,7 +352,7 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
   - **Stamps** `provision.*` version metadata on the created/updated root (§5.6).
   - Response: `{ space_uid, external_id, blueprint_name, version, status, nodes:[{path,
     uid, action}], actions:[{ref, folder_uid, binding_id, action}], warnings:[...] }`.
-- `GET /v1/provisioning/spaces?tenant=&external_id=&template_id=` — list within scope.
+- `GET /v1/provisioning/spaces?tenant=&external_id=&blueprint_name=` — list within scope.
 - `GET /v1/provisioning/spaces/{space_uid}` — inspect: node map, applied
   template+version, and **drift** vs the current template.
 - `PATCH /v1/provisioning/spaces/{space_uid}` — re-apply / upgrade to a newer
@@ -457,7 +457,7 @@ Automation (`actions`) is applied **after** the folder tree, in two steps:
 ## 8. Audit (`audit.py` → Redis audit stream)
 
 Emit to the platform audit stream (drained by `audit_service`) — tamper-evident,
-attributable. Events, each `{ integration_id, tenant, template_id, version,
+attributable. Events, each `{ integration_id, tenant, blueprint_name, version,
 space_uid, external_id, mode, outcome, source_ip }`:
 - `provisioning.space_applied`, `provisioning.space_reconciled`,
   `provisioning.space_deleted`, `provisioning.action_configured` (binding
