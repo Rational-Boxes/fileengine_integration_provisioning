@@ -39,10 +39,11 @@ Integrator backend  ──(integration-service token, §14.2)──▶  Provisio
   browser or the embed kit. Requests carry an **integration-service token** (§14.2:
   `sub = integration_id`, `amr:["integration"]`, `provisioning` capability, scope
   claims). Blueprints are authored in the integrator's own system and passed inline (§5.0); no admin authoring surface here.
-- **Depends on** (upstream, embedding-kit §14): the integration **registry** +
-  credential UI (§14.1, ldap_manager) and the **exchange endpoint** (§14.2,
-  http_bridge) that mints the integration-service token. This service **consumes**
-  those tokens; it does not mint them.
+- **Depends on** (upstream, embedding-kit §14): the integration **registry**
+  (deployment-level **config files** — public keys + scopes — allocated by a
+  deployment/cluster **management CLI**, not a tenant UI; §14.1) and the **exchange
+  endpoint** (§14.2, http_bridge) that mints the integration-service token from it.
+  This service **consumes** those tokens; it does not mint them.
 - **Writes go through the core** (gRPC via `python_interface`), so all existing
   ACL, versioning, tenancy, and audit invariants hold unchanged. This service adds
   orchestration + a blueprint-snapshot / idempotency store, not a new write path.
@@ -100,10 +101,31 @@ Mirrors the lane's auth stack (`jwt_verify.py` + `bridge_auth.py` + `http_auth.p
     Rejected as default because it concentrates privilege and loses core-side
     enforcement.
 
+### 3.0 Deployment model — deployment-wide, multi-tenant integrations
+A FileEngine **deployment is bespoke** to a stack of external application deployments.
+An integration credential is therefore **deployment-wide**, not scoped to a single
+tenant, and the external system is responsible for **spinning up many tenants
+dynamically** — a *fully-integrated tenant provision* per external system.
+- **New tenant = LDAP OU (external app) → adopt (FileEngine).** The external app
+  creates the tenant's OU structure in the **shared LDAP** (Posture B); provisioning
+  then validates + adopts it (§3.2) and applies that tenant's blueprints/resources.
+  Tenant *identity* is the external app's job; tenant *content* is provisioning's.
+- **Scope is deployment-wide by default.** `prov_tenants` defaults to `"*"` (any
+  tenant in the deployment) because tenants are created on the fly; each request's
+  tenant is still LDAP-validated (§3.2). `prov_roots`/`prov_namespace` scope *within*
+  each tenant.
+- **One (or few) integrations per deployment.** Since the deployment is dedicated to
+  the integration's external-app stack, there is typically one integration (or a small
+  set); the per-integration `prov_namespace` still keeps their tenant-scoped resources
+  from colliding.
+
 ### 3.1 Scope claims (carried by the integration-service token)
 Minted by the exchange endpoint from the registry (§14.1) so this service enforces
 without reading the registry DB:
-- `prov_tenants: [..]` — allowed tenant(s).
+- `prov_tenants: [pattern, ..] | "*"` — tenants the integration may operate in.
+  **Because integrations are deployment-wide and create tenants dynamically (§3.0),
+  the default is `"*"` (any tenant in the deployment, still LDAP-validated, §3.2);**
+  set a pattern (e.g. a tenant-name prefix) only to sub-scope.
 - `prov_roots: [uid|path, ..]` — root prefix(es) under which spaces may be created.
 - `prov_principals: [pattern, ..]` — role/claim patterns it may grant (e.g.
   `role:project:*`), never `system_admin`.
