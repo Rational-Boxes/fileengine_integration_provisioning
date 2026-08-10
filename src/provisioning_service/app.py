@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .auth import IntegrationContext
 from .config import Config
+from .deps import require_integration
 
 log = logging.getLogger("provisioning_service")
 
@@ -54,6 +56,17 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     async def readyz():
         # P0: liveness only. Later phases check DB + core reachability.
         return {"status": "ready"}
+
+    # First authenticated route — proves the integration-service auth chain
+    # (bearer → HS256 verify → client-IP derivation → capability + aip gate, §3).
+    @app.get("/v1/provisioning/whoami")
+    async def whoami(ctx: IntegrationContext = Depends(require_integration)):
+        return {
+            "integration_id": ctx.integration_id,
+            "tenant": ctx.tenant,
+            "namespace": ctx.prov_namespace,
+            "capabilities": ctx.capabilities,
+        }
 
     return create_app_finalize(app)
 
