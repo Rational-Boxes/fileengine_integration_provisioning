@@ -15,16 +15,20 @@ from fastapi.responses import JSONResponse
 from .auth import IntegrationContext
 from .config import Config
 from .deps import require_integration
+from .providers import Providers, default_providers
 
 log = logging.getLogger("provisioning_service")
 
 _MONITOR_PATHS = {"/healthz", "/readyz", "/poolz"}
 
 
-def create_app(config: Optional[Config] = None) -> FastAPI:
+def create_app(config: Optional[Config] = None,
+               providers: Optional[Providers] = None) -> FastAPI:
     cfg = config or Config()
     app = FastAPI(title="FileEngine Provisioning Service", version="0.1.0")
     app.state.config = cfg
+    # Collaborators (store/orchestrators/core factory) — injectable for tests.
+    app.state.providers = providers or default_providers(cfg)
 
     # Monitoring endpoints are unauthenticated → restrict to loopback / allow-ips
     # (monitoring-port-binding convention).
@@ -72,7 +76,8 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
 
 def create_app_finalize(app: FastAPI) -> FastAPI:
-    # Placeholder for router registration (P1+): app.include_router(api_router) …
+    from .api import router as provisioning_router
+    app.include_router(provisioning_router)
     return app
 
 
