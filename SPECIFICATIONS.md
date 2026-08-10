@@ -21,6 +21,11 @@ own per-tenant Postgres, Redis audit emission, loopback monitoring endpoints, an
 - **Port:** `8100` (next free after folder_actions :8099).
 - **Package:** `provisioning_service` (dir `commercial_provisioning/`).
 
+> **Cross-reference convention:** `§14.1/§14.2/§14.6/§14.7` (registry, exchange, edge
+> CORS, provisioning proposal) refer to the **embedding-kit** spec
+> (`fileengine_commercial_integration_components`). This document's own numbered
+> sections are §1–§14 (Decisions) + §14a; there is no §14.1/§14.2/§14.7 *here*.
+
 ---
 
 ## 1. Role in the stack
@@ -126,8 +131,8 @@ up many tenants dynamically** — a *fully-integrated tenant provision* per tena
   contends.
 
 ### 3.1 Scope claims (carried by the integration-service token)
-Minted by the exchange endpoint from the registry (§14.1) so this service enforces
-without reading the registry DB:
+Minted by the exchange endpoint from the integration registry (deployment config,
+embedding-kit §14.1) so this service enforces without reading the registry itself:
 - `prov_tenants: [pattern, ..] | "*"` — tenants the integration may operate in.
   **Because integrations are deployment-wide and create tenants dynamically (§3.0),
   the default is `"*"` (any tenant in the deployment, still LDAP-validated, §3.2);**
