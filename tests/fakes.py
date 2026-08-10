@@ -72,3 +72,31 @@ class FakeCore:
             if cur is None:
                 return None
         return cur
+
+
+class FakeResources:
+    """Records tenant-scoped resource applies; returns a deterministic id."""
+
+    def __init__(self):
+        self.applied: list[dict] = []
+
+    def apply(self, *, tenant, namespace, rtype, name, body, managed_by) -> str:
+        self.applied.append({"tenant": tenant, "namespace": namespace, "type": rtype,
+                             "name": name, "body": body, "managed_by": managed_by})
+        return f"{rtype}:{namespace}/{name}"
+
+
+class FakeActions:
+    """Records folder_actions binding applies (with the fully-resolved config)."""
+
+    def __init__(self):
+        self.applied: list[dict] = []
+
+    def apply(self, *, folder_uid, ref, atype, on_events, mime_types, config, managed_by) -> str:
+        self.applied.append({"folder_uid": folder_uid, "ref": ref, "type": atype,
+                             "on_events": on_events, "mime_types": mime_types,
+                             "config": config, "managed_by": managed_by})
+        return f"binding-{ref}"
+
+    def by_ref(self, ref: str) -> dict:
+        return next(a for a in self.applied if a["ref"] == ref)
