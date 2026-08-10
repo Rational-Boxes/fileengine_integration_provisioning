@@ -60,7 +60,14 @@ to the common directory, or uses ldap_manager admin) — templates *bind to* exi
 roles/claims, they don't create them. **Tenants** are likewise defined by their LDAP
 OU structure (§3.2), initialized by the embedding application *before* FileEngine is
 touched; provisioning only validates + adopts them. No end-user surface (the embed
-kit never calls this). No ACL-editing UI. No token minting (that's §14.2).
+kit never calls this). No ACL-editing UI. No token minting (that's §14.2). **No
+browser-facing session/OAuth support** — the embed kit's session handshake needs no
+integrator server (embedding-kit §6): its browser-facing pieces (OAuth callback page,
+`session/config`) are public and live at the **FileEngine edge / http_bridge**, *not*
+here. This service is **server-to-server only** (called by the integrator's backend
+with an integration-service token); it is not browser-exposed, so it is the wrong home
+for the public callback. Server-to-server integration helpers *could* co-locate here,
+but the session handshake needs none.
 
 ---
 
