@@ -7,9 +7,12 @@ provisioning surface (§14.7 of `fileengine_commercial_integration_components`).
 
 - **What it is:** a FastAPI service lane (like `folder_actions`, `discussion`,
   `convert_search_ai`, `bcf_service`) that verifies an **integration-service token**
-  (§14.2), then applies declarative, versioned **space templates** to the core via
-  gRPC (`../python_interface`), idempotently and within a bounded scope, emitting
-  `provisioning.*` audit events.
+  (§14.2), then applies an **inline JSON blueprint** (folders + ACLs + metadata +
+  per-space folder_actions automation) to the core via gRPC (`../python_interface`)
+  and to folder_actions (:8099), idempotently and within a bounded scope. Blueprints
+  are **not stored** in FileEngine — they live in the integrator's system and are
+  passed per call; a **`version`** is stamped on the space root's metadata for
+  trackability. Emits `provisioning.*` audit events.
 - **What it is not:** an end-user surface (the browser embed kit never calls it), an
   identity authority (roles/membership stay in the shared LDAP), or a token minter.
 - **License:** AGPL-3.0-or-later. **Port:** `8100`. **Package:** `provisioning_service`.

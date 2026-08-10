@@ -96,7 +96,6 @@ Minted by the exchange endpoint from the registry (§14.1) so this service enfor
 without reading the registry DB:
 - `prov_tenants: [..]` — allowed tenant(s).
 - `prov_roots: [uid|path, ..]` — root prefix(es) under which spaces may be created.
-- `prov_templates: [template_id, ..] | "*"` — templates it may apply.
 - `prov_principals: [pattern, ..]` — role/claim patterns it may grant (e.g.
   `role:project:*`), never `system_admin`.
 - `prov_actions: [type, ..] | "*"` — folder_actions binding types it may configure
@@ -143,15 +142,14 @@ structure in the shared LDAP directory** (`FILEENGINE_LDAP_TENANT_BASE`, e.g.
 Owns its own database (`PROV_PG_*`, default DB `provisioning`), per-tenant schemas
 `tenant_<slug>` (as folder_actions), idempotent DDL via `ensure_tenant_schema`.
 
-- **`space_template`** — `template_id`, `name`, `description`, `enabled`, timestamps.
-- **`space_template_version`** — `template_id`, `version` (int), `body` JSONB (the
-  declarative template, §5), `params` (declared inputs), `created_by`, `created_at`.
-  Templates are **immutable per version**; edits create a new version. Applied
-  spaces record the version they were built from.
-- **`provisioned_space`** — the idempotency + provenance record:
+- **`provisioned_space`** — the idempotency + provenance record. **No template
+  library is stored** (§5.0): the integrator passes the blueprint inline each call.
   `external_id` (integrator's key, **unique per (tenant, integration_id)**),
-  `integration_id`, `tenant`, `template_id`, `version`, `space_uid` (core root uid),
-  `params` JSONB, `status`, `created_at`, `last_applied_at`.
+  `integration_id`, `tenant`, `space_uid` (core root uid), `blueprint_name`
+  (integrator's logical id), `version` (integrator-supplied — also stamped on the
+  root metadata, §5.6), `last_blueprint` JSONB (snapshot of the last applied
+  document, for reconcile/drift), `params` JSONB (secrets redacted), `status`,
+  `created_at`, `last_applied_at`.
 - **`provisioned_node`** — template-path → core `uid` map for a space (so reconcile
   is stable across runs, drift can be computed, and `${node:<path>}` references
   resolve): `space_id`, `path`, `uid`, `kind`, `created_at`.
@@ -168,7 +166,15 @@ the replica.
 
 ---
 
-## 5. Space blueprint (declarative, versioned) — structure **and** setup
+## 5. Space blueprint (inline JSON document) — structure **and** setup
+
+### 5.0 No stored templates — the blueprint is passed inline
+FileEngine does **not** store a provisioning template library. The integrator's
+backend passes a **rich JSON blueprint document** to the integration endpoint
+(§6.1) on each apply, describing the desired space. This keeps the source-of-truth
+for "what a project space looks like" in the integrator's own system (versioned in
+their repo/config), not duplicated in FileEngine. The provisioning service snapshots
+the last-applied blueprint per space (`last_blueprint`) only for reconcile/drift.
 
 A blueprint is **not** a static folder clone. It declares the full initial setup of
 a space — folder tree, ACLs, metadata, **and per-space automation** (folder_actions
@@ -176,7 +182,11 @@ bindings: webhooks, notify, sorter, review chains) — driven by a **typed param
 schema** so each space/project is customized at apply time. Real setups differ per
 project: a webhook's **context data map** and callback URL, a **notify** action's
 recipients/template/subject, a sorter's classifier set, review reviewers — all are
-parameters supplied per space, not baked into the template.
+parameters supplied per space.
+
+The document carries top-level `name` (the integrator's logical blueprint id) and
+`version` (§5.6), plus `params` (schema), `root` (structure), and `actions`
+(automation).
 
 ### 5.1 Parameter schema (`params`) — typed, validated per-space inputs
 Each declared param has a `type`, `required`, optional `default`/`description`, and
@@ -288,6 +298,30 @@ dangling destinations); no cyclic/oversized trees (bounded depth + node count);
 permission letters and event names known; `config` shapes validated against each
 action type's schema (delegated to folder_actions' `/action-types` contract).
 
+### 5.6 Versioning & trackability (stamped on the space root metadata)
+Rather than a stored template version, the integrator passes a **`version`** (their
+own version of the provisioning structure) on each apply. Provisioning **stamps it
+onto the space root folder's metadata** in the core, so the version travels with the
+space and any client can inspect it:
+- Root metadata keys written on apply: `provision.name`, `provision.version`,
+  `provision.integration_id`, `provision.external_id`, `provision.applied_at`.
+- **The embedder inspects** the root's metadata (`GET /v1/nodes/{root}/metadata`) to
+  learn which generation of the provisioning structure a space is on, and decides
+  whether to trigger an upgrade (the integrator re-applies a newer blueprint + higher
+  `version`; §7 reconcile/enforce converges it and re-stamps the metadata).
+- The provisioning DB also records `version`/`blueprint_name` on `provisioned_space`
+  for its own listing/idempotency, but **the core metadata on the root is the
+  authoritative, inspectable version marker** — it needs no call to this service.
+- Version is opaque to provisioning (string; integrators may use semver or an int);
+  it is not interpreted, only stamped and echoed.
+- **Upgrade is the embedding application's responsibility, not the service's.** The
+  integrator inspects existing spaces' root-metadata version, and where it lags the
+  app's current structure, applies the updated blueprint (`reconcile`/`enforce`) to
+  migrate the folder/automation schema and **bump the stamped version**. Provisioning
+  never proactively upgrades or scans for out-of-date spaces — it applies what it is
+  told and records the result. (The optional `reconcile.py` sweep is for *internal
+  drift* — e.g. a binding manually changed — not version migration.)
+
 ---
 
 ## 6. API surface
@@ -296,25 +330,27 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
 **integration-service token**; template routes require **admin**.
 
 ### 6.1 Spaces (integration-driven)
-- `POST /v1/provisioning/spaces` — apply a blueprint (create/reconcile a space:
-  folders + ACLs + metadata **+ automation**).
-  Body: `{ template_id, version?, tenant, parent_uid?, params:{...}, external_id,
+- `POST /v1/provisioning/spaces` — the **integration endpoint**: apply an **inline
+  blueprint** (create/reconcile a space: folders + ACLs + metadata **+ automation**).
+  Body: `{ tenant, external_id, version, blueprint:{...}, params:{...}, parent_uid?,
   mode?: "create"|"reconcile"|"enforce", dry_run?: bool }`.
-  - **`params`** supplies all per-space customization declared by the blueprint's
-    parameter schema (§5.1) — scalars, the webhook **context data map**, notify
-    recipients/template/fields, classifier refs, `secret` values, etc. Validated
-    against the schema; `secret`s are write-only (§5.4).
+  - **`blueprint`** is the full JSON document (§5) — passed inline, not stored/
+    referenced by id. **`version`** is the integrator's version, stamped onto the
+    root metadata (§5.6). **`params`** supplies the per-space customization declared
+    by the blueprint schema (scalars, webhook **context data map**, notify
+    recipients/template/fields, classifier refs, `secret`s — write-only, §5.4).
   - **Idempotent by `external_id`** (unique per tenant+integration): a repeat call
-    returns the same space, never a duplicate. `parent_uid` defaults to the
+    reconciles the same space, never a duplicate. `parent_uid` defaults to the
     integration's scoped root (must be within `prov_roots`).
   - **`mode`:** `create` (fail if exists) · `reconcile` (default; create-missing,
     additive, non-destructive) · `enforce` (also correct drifted ACLs/metadata **and
     action config** to match the blueprint; never destructive to user content).
   - **`dry_run:true`** → return the **plan** (folders + actions) without applying.
   - **Preconditions:** tenant valid in LDAP (§3.2) else `409 tenant_not_initialized`;
-    `tenant ∈ prov_tenants`; `template_id ∈ prov_templates`; `parent_uid ∈ prov_roots`;
-    each action `type ∈ prov_actions`.
-  - Response: `{ space_uid, external_id, template_id, version, status, nodes:[{path,
+    `tenant ∈ prov_tenants`; `parent_uid ∈ prov_roots`; each action `type ∈ prov_actions`;
+    blueprint validates (§5.5).
+  - **Stamps** `provision.*` version metadata on the created/updated root (§5.6).
+  - Response: `{ space_uid, external_id, blueprint_name, version, status, nodes:[{path,
     uid, action}], actions:[{ref, folder_uid, binding_id, action}], warnings:[...] }`.
 - `GET /v1/provisioning/spaces?tenant=&external_id=&template_id=` — list within scope.
 - `GET /v1/provisioning/spaces/{space_uid}` — inspect: node map, applied
@@ -328,14 +364,14 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
   honors the core's recoverable-delete + versioning); optional, off by default
   (`PROV_ALLOW_SPACE_DELETE`).
 
-### 6.2 Templates (admin — official SPA *Provisioning* editor)
-- `GET /v1/provisioning/templates` — list (an integration token sees only the
-  subset its `prov_templates` permits).
-- `GET /v1/provisioning/templates/{id}` — fetch (+ versions).
-- `POST /v1/provisioning/templates` · `PUT /v1/provisioning/templates/{id}` — create
-  / new immutable version (admin).
-- `DELETE /v1/provisioning/templates/{id}` — retire (existing spaces keep their
-  applied version).
+### 6.2 Blueprint validation (no stored template library)
+There is **no** template CRUD / stored template store / SPA template editor (§5.0):
+blueprints live in the integrator's own system and are passed inline (§6.1). One
+authoring aid only:
+- `POST /v1/provisioning/blueprints/validate` — validate a blueprint document
+  (schema + `${node}` resolution + scope checks, §5.5) and return the normalized
+  plan, without a tenant/space. Equivalent to `POST /spaces` with `dry_run` but
+  without creating a `provisioned_space` record. Handy in the integrator's CI.
 
 ### 6.3 Per-space configuration & setup API (rich, post-provision customization)
 Beyond one-shot apply, a space's **automation config** is separately inspectable and
@@ -370,12 +406,13 @@ per the platform monitoring convention. Not on the public surface.
 - **Resolve tenant first (§3.2).** Validate the request tenant against LDAP and boot
   its metadata (reject `tenant_not_initialized` if the OU is absent); the core
   materializes the tenant lazily on the first write. Only then plan/apply.
-- **Plan → apply.** Resolve the template version, substitute `params`, and compute
-  a **plan**: the desired node tree + ACL/metadata. Diff against `provisioned_node`
-  (existing map) + live core state to classify each node create/existing/updated.
+- **Plan → apply.** Parse the inline `blueprint`, substitute `params`, and compute a
+  **plan**: the desired node tree + ACL/metadata + actions. Diff against
+  `provisioned_node`/`provisioned_binding` (existing maps) + live state to classify
+  each item create/existing/updated. Stamp the `provision.*` version metadata (§5.6).
 - **Idempotent + reconcilable.** First apply creates; later applies converge to the
-  (possibly upgraded) template. Safe to call unconditionally on every "new project"
-  event and safe to retry.
+  (possibly newer-`version`) blueprint the caller passes. Safe to call unconditionally
+  on every "new project" event and safe to retry.
 - **Never destructive by default.** `reconcile`/`enforce` only add folders and
   adjust ACLs/metadata; they never delete user folders/content. Removal is the
   explicit, separately-scoped `DELETE`.
@@ -524,7 +561,9 @@ Console scripts (`pyproject`): `provisioning-service = provisioning_service.app:
 1. **P0 — Skeleton.** `pyproject`, config, app factory, auth stack (verify
    integration/admin tokens), `python_interface` core client, per-tenant schema,
    `/healthz`. Boots against the dev stack.
-2. **P1 — Templates.** template CRUD (admin) + validation + versioning store.
+2. **P1 — Blueprint validation.** inline blueprint parse/validate (§5.5) +
+   `/blueprints/validate`; version stamping on the root metadata (§5.6). No stored
+   template library.
 3. **P2 — Apply engine (structure).** `POST /spaces` create + `reconcile`,
    idempotency by `external_id`, node map, core mkdir/grant/metadata as the
    integration principal, `provisioning.*` audit. First usable release (folders +
@@ -549,8 +588,9 @@ the §14.7 provisioning surface.
    a single provisioning service principal. Confirm the per-integration model is
    acceptable given it requires the registry to create/grant a service identity on
    the scoped root at integration registration.
-2. **Template scope**: tenant-scoped templates (default, per-tenant schema) vs a
-   global template library shared across tenants. 
+2. **Version semantics**: `version` is opaque/integrator-owned (default — stamped &
+   echoed, not interpreted). Confirm provisioning need not enforce monotonic upgrade
+   (reject a lower version) — or add an optional guard.
 3. **Role-binding convenience** (§2/§14.7.6): keep role/membership strictly in the
    shared directory (v1), or add an optional "ensure these role bindings exist" hook
    later.
