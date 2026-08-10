@@ -70,6 +70,9 @@ class Config:
         self.bridge_url = _env(e, "PROV_BRIDGE_URL", "http://localhost:8090")
         self.bridge_introspect_ttl = _int(e, "PROV_BRIDGE_INTROSPECT_TTL", 30)
         self.provisioning_role = _env(e, "PROV_PROVISIONING_ROLE", "provisioning")
+        # Validate the tenant's LDAP OU before adopting (§3.2). Off by default so a
+        # dev stack without LDAP still works; enable in real deployments.
+        self.enforce_tenant_ldap = _bool(e, "PROV_ENFORCE_TENANT_LDAP", False)
 
         # --- source-IP enforcement (§3.3) ---
         self.trusted_proxies = _csv(e, "PROV_TRUSTED_PROXIES") or ["127.0.0.1", "::1"]

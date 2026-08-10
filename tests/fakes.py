@@ -100,3 +100,26 @@ class FakeActions:
 
     def by_ref(self, ref: str) -> dict:
         return next(a for a in self.applied if a["ref"] == ref)
+
+
+class FakeAudit:
+    """Records emitted audit events."""
+
+    def __init__(self):
+        self.events: list[tuple] = []   # (event, fields)
+
+    def emit(self, event: str, **fields) -> None:
+        self.events.append((event, fields))
+
+    def names(self) -> list[str]:
+        return [e for e, _ in self.events]
+
+
+class FakeTenant:
+    """Tenant validator with a toggle for tests."""
+
+    def __init__(self, valid: bool = True):
+        self.valid = valid
+
+    def is_valid(self, tenant: str) -> bool:
+        return self.valid

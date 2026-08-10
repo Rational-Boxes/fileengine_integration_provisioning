@@ -10,10 +10,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from . import audit as au
 from . import blueprint as bp
 from .auth import IntegrationContext
 from .config import Config
-from .deps import get_config, require_integration
+from .deps import get_config, request_client_ip, require_integration
 from .engine import ApplyRequest, Engine
 
 router = APIRouter(prefix="/v1/provisioning", tags=["provisioning"])
@@ -50,16 +51,30 @@ def apply_space(
     ctx: IntegrationContext = Depends(require_integration),
     cfg: Config = Depends(get_config),
 ) -> dict[str, Any]:
-    _scope_check(ctx, body)
     providers = request.app.state.providers
+    src_ip = request_client_ip(request, cfg)
 
-    # TODO(§3.2): validate the tenant's LDAP OU exists (else 409 tenant_not_initialized).
+    def _reject(status: int, detail: dict):
+        providers.audit.emit(au.REJECTED, integration_id=ctx.integration_id,
+                             tenant=body.tenant, external_id=body.external_id,
+                             outcome=detail.get("code"), source_ip=src_ip)
+        raise HTTPException(status, detail)
+
+    try:
+        _scope_check(ctx, body)
+    except HTTPException as e:
+        _reject(e.status_code, e.detail)
+
+    # Tenant model (§3.2): the tenant's LDAP OU must exist (external app inits it first);
+    # the core materializes the schema/storage lazily on the first write.
     if not body.dry_run:
+        if not providers.tenant_validator.is_valid(body.tenant):
+            _reject(409, {"code": "tenant_not_initialized", "tenant": body.tenant})
         providers.store.ensure_tenant(body.tenant)
 
     existing = providers.store.find_space(body.tenant, ctx.integration_id, body.external_id)
     if body.mode == "create" and existing and not body.dry_run:
-        raise HTTPException(409, {"code": "already_exists", "external_id": body.external_id})
+        _reject(409, {"code": "already_exists", "external_id": body.external_id})
 
     engine = Engine(
         providers.make_core(ctx.integration_id, body.tenant),
@@ -74,10 +89,16 @@ def apply_space(
     try:
         result = engine.apply(req)
     except bp.BlueprintError as e:
-        raise HTTPException(422, {"code": "invalid_blueprint", "errors": e.errors})
+        _reject(422, {"code": "invalid_blueprint", "errors": e.errors})
 
     if not body.dry_run:
         providers.store.persist(body.tenant, req, result)
+        providers.audit.emit(
+            au.space_event(result.status), integration_id=ctx.integration_id,
+            tenant=body.tenant, blueprint_name=result.blueprint_name,
+            version=result.version, space_uid=result.space_uid,
+            external_id=body.external_id, mode=body.mode, outcome=result.status,
+            source_ip=src_ip)
 
     return dataclasses.asdict(result)
 

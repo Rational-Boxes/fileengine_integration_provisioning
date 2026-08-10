@@ -15,7 +15,7 @@ from provisioning_service.config import Config  # noqa: E402
 from provisioning_service.providers import Providers  # noqa: E402
 from provisioning_service.stores import InMemoryStore  # noqa: E402
 
-from fakes import FakeActions, FakeCore, FakeResources  # noqa: E402
+from fakes import FakeActions, FakeAudit, FakeCore, FakeResources, FakeTenant  # noqa: E402
 
 SECRET = "unit-test-shared-secret-value-32b!"
 
@@ -32,10 +32,11 @@ def _doc():
     }
 
 
-def _harness(env=None):
+def _harness(env=None, tenant_valid=True):
     core = FakeCore()
     prov = Providers(store=InMemoryStore(), resources=FakeResources(),
-                     actions=FakeActions(), make_core=lambda i, t: core)
+                     actions=FakeActions(), make_core=lambda i, t: core,
+                     audit=FakeAudit(), tenant_validator=FakeTenant(tenant_valid))
     base = {"FILEENGINE_JWT_SECRET": SECRET}
     base.update(env or {})
     client = TestClient(create_app(Config(env=base), providers=prov))
@@ -123,3 +124,37 @@ def test_list_spaces_by_external_id():
     r = client.get("/v1/provisioning/spaces", params={"tenant": "t1", "external_id": "proj-1"},
                    headers=_tok())
     assert r.status_code == 200 and len(r.json()["spaces"]) == 1
+
+
+# --- tenant validation (§3.2) + audit (§8) ----------------------------------
+
+def test_tenant_not_initialized_409():
+    client, prov, _c = _harness(tenant_valid=False)
+    r = client.post("/v1/provisioning/spaces", json=_body(), headers=_tok())
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "tenant_not_initialized"
+    assert "provisioning.rejected" in prov.audit.names()
+
+
+def test_success_emits_space_reconciled_audit():
+    client, prov, _c = _harness()
+    client.post("/v1/provisioning/spaces", json=_body(), headers=_tok())
+    ev = prov.audit.events[-1]
+    assert ev[0] == "provisioning.space_reconciled"
+    assert ev[1]["integration_id"] == "acme-crm"
+    assert ev[1]["external_id"] == "proj-1"
+    assert ev[1]["source_ip"]                    # derived client ip present
+
+
+def test_scope_reject_is_audited():
+    client, prov, _c = _harness()
+    client.post("/v1/provisioning/spaces", json=_body(tenant="other"),
+                headers=_tok(prov_tenants=["t1"]))
+    assert prov.audit.names() == ["provisioning.rejected"]
+
+
+def test_dry_run_does_not_audit_or_validate_tenant():
+    # dry_run skips tenant validation + persistence + audit (it is a plan)
+    client, prov, _c = _harness(tenant_valid=False)
+    r = client.post("/v1/provisioning/spaces", json=_body(dry_run=True), headers=_tok())
+    assert r.status_code == 200 and r.json()["status"] == "planned"
+    assert prov.audit.events == []
