@@ -35,6 +35,7 @@ def _space_row(req, result) -> dict:
         "blueprint_name": result.blueprint_name,
         "version": result.version,
         "params": req.params,
+        "blueprint": req.blueprint,   # retained for the §6.3 config re-render
         "status": result.status,
     }
 
@@ -205,7 +206,8 @@ class PgStore:
         with conn.cursor() as cur:
             cur.execute(
                 f'SELECT id, external_id, integration_id, space_uid, blueprint_name, '
-                f'version, status FROM "{s}".provisioned_space WHERE space_uid=%s',
+                f'version, status, last_blueprint, params FROM "{s}".provisioned_space '
+                f'WHERE space_uid=%s',
                 (space_uid,))
             r = cur.fetchone()
             if not r:
@@ -220,7 +222,8 @@ class PgStore:
                         for rf, fu, bid, t in cur.fetchall()]
         return {"id": space_id, "external_id": r[1], "integration_id": r[2],
                 "space_uid": r[3], "blueprint_name": r[4], "version": r[5],
-                "status": r[6], "nodes": nodes, "bindings": bindings}
+                "status": r[6], "blueprint": r[7], "params": r[8] or {},
+                "nodes": nodes, "bindings": bindings}
 
     def soft_delete_space(self, tenant, space_uid):
         s = schema.schema_name(tenant)

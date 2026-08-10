@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import audit as au
 from . import blueprint as bp
+from . import space_config as sc
 from .auth import IntegrationContext
 from .config import Config
 from .deps import get_config, request_client_ip, require_integration
@@ -131,6 +132,76 @@ def inspect_space(
     if not rec or rec.get("integration_id") not in (None, ctx.integration_id):
         raise HTTPException(404, {"code": "not_found"})
     return rec
+
+
+@router.get("/spaces/{space_uid}/config")
+def get_space_config(
+    space_uid: str, tenant: str, request: Request,
+    ctx: IntegrationContext = Depends(require_integration),
+) -> dict[str, Any]:
+    """§6.3: the space's resolved automation config (bindings + params, secrets redacted)."""
+    if not ctx.tenant_allowed(tenant):
+        raise HTTPException(403, {"code": "tenant_not_allowed"})
+    rec = request.app.state.providers.store.get_space_by_uid(tenant, space_uid)
+    if not rec or rec.get("integration_id") not in (None, ctx.integration_id):
+        raise HTTPException(404, {"code": "not_found"})
+    return sc.resolved_config(rec, rec.get("blueprint") or {})
+
+
+class ConfigPatchBody(BaseModel):
+    tenant: str
+    params: dict = Field(default_factory=dict)
+
+
+@router.patch("/spaces/{space_uid}/config")
+def patch_space_config(
+    space_uid: str, body: ConfigPatchBody, request: Request,
+    ctx: IntegrationContext = Depends(require_integration),
+    cfg: Config = Depends(get_config),
+) -> dict[str, Any]:
+    """§6.3: update per-space param values (webhook context, notify recipients, …) and
+    re-render the affected bindings via an idempotent reconcile of the stored blueprint."""
+    if not ctx.tenant_allowed(body.tenant):
+        raise HTTPException(403, {"code": "tenant_not_allowed"})
+    providers = request.app.state.providers
+    rec = providers.store.get_space_by_uid(body.tenant, space_uid)
+    if not rec or rec.get("integration_id") != ctx.integration_id:
+        raise HTTPException(404, {"code": "not_found"})
+    if rec.get("status") == "deleted":
+        raise HTTPException(409, {"code": "space_deleted"})
+    blueprint = rec.get("blueprint")
+    if not blueprint:
+        raise HTTPException(409, {"code": "no_blueprint", "detail": "space has no stored blueprint to re-render"})
+    # Action scope still applies to the re-render.
+    for a in blueprint.get("actions") or []:
+        if not ctx.action_allowed(a.get("type", "")):
+            raise HTTPException(403, {"code": "action_not_allowed", "type": a.get("type")})
+
+    merged = sc.merge_params(rec.get("params"), body.params)
+    engine = Engine(
+        providers.make_core(ctx.integration_id, body.tenant),
+        providers.resources, providers.actions,
+        max_nodes=cfg.max_tree_nodes, max_depth=cfg.max_tree_depth)
+    req = ApplyRequest(
+        tenant=body.tenant, external_id=rec["external_id"], version=rec.get("version", ""),
+        blueprint=blueprint, params=merged, parent_uid=None,
+        mode="reconcile", dry_run=False,
+        integration_id=ctx.integration_id, namespace=ctx.prov_namespace)
+    try:
+        result = engine.apply(req)
+    except bp.BlueprintError as e:
+        raise HTTPException(422, {"code": "invalid_blueprint", "errors": e.errors})
+
+    providers.store.persist(body.tenant, req, result)
+    providers.audit.emit(
+        au.space_event(result.status), integration_id=ctx.integration_id,
+        tenant=body.tenant, blueprint_name=result.blueprint_name, version=result.version,
+        space_uid=result.space_uid, external_id=rec["external_id"], mode="reconcile",
+        outcome=result.status, source_ip=request_client_ip(request, cfg))
+
+    return {"space_uid": result.space_uid, "version": result.version,
+            "params": sc.redact_params(merged, blueprint),
+            "actions": result.actions, "warnings": result.warnings}
 
 
 @router.delete("/spaces/{space_uid}")
