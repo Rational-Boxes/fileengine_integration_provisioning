@@ -48,3 +48,25 @@ def test_persist_records_nodes_and_bindings():
     key = ("t1", "acme", "p1")
     assert s.nodes[key][0]["uid"] == "uid-1"
     assert s.bindings[key][0]["binding_id"] == "b"
+
+
+def test_get_space_by_uid_and_soft_delete():
+    s = InMemoryStore()
+    s.persist("t1", _req(), _result("uid-9"))
+    got = s.get_space_by_uid("t1", "uid-9")
+    assert got and got["nodes"] and got["bindings"]
+    assert s.get_space_by_uid("t1", "missing") is None
+    assert s.soft_delete_space("t1", "uid-9") is True
+    assert s.find_space("t1", "acme", "p1")["status"] == "deleted"
+    assert s.soft_delete_space("t1", "missing") is False
+
+
+def test_resource_apply_find_delete_refcount_guard():
+    s = InMemoryStore()
+    s.apply_resource("t1", "acme", "classifier_set", "shared", "cs:1", "acme")
+    assert s.find_resource("t1", "acme", "classifier_set", "shared")["service_object_id"] == "cs:1"
+    # ref-counted → blocked without force
+    s.resources[("t1", "acme", "classifier_set", "shared")]["ref_count"] = 2
+    assert s.delete_resource("t1", "acme", "classifier_set", "shared") is False
+    assert s.delete_resource("t1", "acme", "classifier_set", "shared", force=True) is True
+    assert s.find_resource("t1", "acme", "classifier_set", "shared") is None

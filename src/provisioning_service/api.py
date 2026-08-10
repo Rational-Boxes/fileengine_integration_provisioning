@@ -118,3 +118,85 @@ def list_spaces(
         return {"spaces": [rec] if rec else []}
     # full listing is a stores concern (later); for now filter by external_id only.
     return {"spaces": []}
+
+
+@router.get("/spaces/{space_uid}")
+def inspect_space(
+    space_uid: str, tenant: str, request: Request,
+    ctx: IntegrationContext = Depends(require_integration),
+) -> dict[str, Any]:
+    if not ctx.tenant_allowed(tenant):
+        raise HTTPException(403, {"code": "tenant_not_allowed"})
+    rec = request.app.state.providers.store.get_space_by_uid(tenant, space_uid)
+    if not rec or rec.get("integration_id") not in (None, ctx.integration_id):
+        raise HTTPException(404, {"code": "not_found"})
+    return rec
+
+
+@router.delete("/spaces/{space_uid}")
+def delete_space(
+    space_uid: str, tenant: str, request: Request,
+    ctx: IntegrationContext = Depends(require_integration),
+    cfg: Config = Depends(get_config),
+) -> dict[str, Any]:
+    if not cfg.allow_space_delete:
+        raise HTTPException(403, {"code": "delete_disabled"})
+    if not ctx.tenant_allowed(tenant):
+        raise HTTPException(403, {"code": "tenant_not_allowed"})
+    providers = request.app.state.providers
+    ok = providers.store.soft_delete_space(tenant, space_uid)
+    if not ok:
+        raise HTTPException(404, {"code": "not_found"})
+    providers.audit.emit(au.SPACE_DELETED, integration_id=ctx.integration_id,
+                        tenant=tenant, space_uid=space_uid,
+                        source_ip=request_client_ip(request, cfg))
+    return {"status": "deleted", "space_uid": space_uid}
+
+
+class ResourceBody(BaseModel):
+    tenant: str
+    type: str
+    name: str
+    body: dict = Field(default_factory=dict)
+
+
+@router.post("/resources")
+def apply_resource(
+    rb: ResourceBody, request: Request,
+    ctx: IntegrationContext = Depends(require_integration),
+    cfg: Config = Depends(get_config),
+) -> dict[str, Any]:
+    if not ctx.tenant_allowed(rb.tenant):
+        raise HTTPException(403, {"code": "tenant_not_allowed"})
+    if not ctx.resource_allowed(rb.type):
+        raise HTTPException(403, {"code": "resource_not_allowed", "type": rb.type})
+    providers = request.app.state.providers
+    providers.store.ensure_tenant(rb.tenant)
+    oid = providers.resources.apply(
+        tenant=rb.tenant, namespace=ctx.prov_namespace, rtype=rb.type,
+        name=rb.name, body=rb.body, managed_by=ctx.integration_id)
+    providers.store.apply_resource(rb.tenant, ctx.prov_namespace, rb.type, rb.name,
+                                   oid, ctx.integration_id)
+    providers.audit.emit(au.RESOURCE_APPLIED, integration_id=ctx.integration_id,
+                        tenant=rb.tenant, type=rb.type, name=rb.name,
+                        source_ip=request_client_ip(request, cfg))
+    return {"type": rb.type, "name": rb.name, "service_object_id": oid, "status": "applied"}
+
+
+@router.delete("/resources/{rtype}/{name}")
+def delete_resource(
+    rtype: str, name: str, tenant: str, request: Request,
+    ctx: IntegrationContext = Depends(require_integration),
+    force: bool = False,
+) -> dict[str, Any]:
+    if not ctx.tenant_allowed(tenant):
+        raise HTTPException(403, {"code": "tenant_not_allowed"})
+    store = request.app.state.providers.store
+    ok = store.delete_resource(tenant, ctx.prov_namespace, rtype, name, force=force)
+    if not ok:
+        rec = store.find_resource(tenant, ctx.prov_namespace, rtype, name)
+        if rec is None:
+            raise HTTPException(404, {"code": "not_found"})
+        raise HTTPException(409, {"code": "resource_in_use",
+                                  "ref_count": rec.get("ref_count")})
+    return {"status": "deleted", "type": rtype, "name": name}

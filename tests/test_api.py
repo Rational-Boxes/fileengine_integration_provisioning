@@ -158,3 +158,75 @@ def test_dry_run_does_not_audit_or_validate_tenant():
     r = client.post("/v1/provisioning/spaces", json=_body(dry_run=True), headers=_tok())
     assert r.status_code == 200 and r.json()["status"] == "planned"
     assert prov.audit.events == []
+
+
+# --- inspect + delete (§6.1) ------------------------------------------------
+
+def test_inspect_space():
+    client, _p, core = _harness()
+    uid = client.post("/v1/provisioning/spaces", json=_body(), headers=_tok()).json()["space_uid"]
+    r = client.get(f"/v1/provisioning/spaces/{uid}", params={"tenant": "t1"}, headers=_tok())
+    assert r.status_code == 200
+    data = r.json()
+    assert data["space_uid"] == uid and data["version"] == "3"
+    assert any(n["uid"] == core.path_uid("ACME", "Approved") for n in data["nodes"])
+
+
+def test_inspect_404():
+    client, _p, _c = _harness()
+    r = client.get("/v1/provisioning/spaces/nope", params={"tenant": "t1"}, headers=_tok())
+    assert r.status_code == 404
+
+
+def test_delete_space_soft_and_audited():
+    client, prov, _c = _harness()
+    uid = client.post("/v1/provisioning/spaces", json=_body(), headers=_tok()).json()["space_uid"]
+    r = client.delete(f"/v1/provisioning/spaces/{uid}", params={"tenant": "t1"}, headers=_tok())
+    assert r.status_code == 200 and r.json()["status"] == "deleted"
+    assert prov.store.find_space("t1", "acme-crm", "proj-1")["status"] == "deleted"
+    assert "provisioning.space_deleted" in prov.audit.names()
+
+
+def test_delete_disabled_403():
+    client, _p, _c = _harness(env={"PROV_ALLOW_SPACE_DELETE": "false"})
+    r = client.delete("/v1/provisioning/spaces/x", params={"tenant": "t1"}, headers=_tok())
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "delete_disabled"
+
+
+# --- standalone resources (§6.4) --------------------------------------------
+
+def _rbody(**over):
+    b = {"tenant": "t1", "type": "classifier_set", "name": "shared", "body": {"classifiers": []}}
+    b.update(over)
+    return b
+
+
+def test_apply_resource_standalone():
+    client, prov, _c = _harness()
+    r = client.post("/v1/provisioning/resources", json=_rbody(), headers=_tok())
+    assert r.status_code == 200 and r.json()["status"] == "applied"
+    # namespaced by prov_namespace in the orchestrator + recorded
+    assert prov.resources.applied[0]["namespace"] == "acme"
+    assert prov.store.find_resource("t1", "acme", "classifier_set", "shared")
+    assert "provisioning.resource_applied" in prov.audit.names()
+
+
+def test_resource_scope_403():
+    client, _p, _c = _harness()
+    r = client.post("/v1/provisioning/resources", json=_rbody(),
+                    headers=_tok(prov_resources=["notify_template"]))
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "resource_not_allowed"
+
+
+def test_delete_resource_ok_and_in_use():
+    client, prov, _c = _harness()
+    client.post("/v1/provisioning/resources", json=_rbody(), headers=_tok())
+    # mark in-use → 409
+    prov.store.resources[("t1", "acme", "classifier_set", "shared")]["ref_count"] = 1
+    r = client.delete("/v1/provisioning/resources/classifier_set/shared",
+                      params={"tenant": "t1"}, headers=_tok())
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "resource_in_use"
+    # force deletes
+    r2 = client.delete("/v1/provisioning/resources/classifier_set/shared",
+                       params={"tenant": "t1", "force": "true"}, headers=_tok())
+    assert r2.status_code == 200

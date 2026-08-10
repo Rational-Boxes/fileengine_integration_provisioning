@@ -16,6 +16,13 @@ class Store(Protocol):
     def ensure_tenant(self, tenant: str) -> None: ...
     def find_space(self, tenant: str, integration_id: str, external_id: str) -> Optional[dict]: ...
     def persist(self, tenant: str, req, result) -> dict: ...
+    def get_space_by_uid(self, tenant: str, space_uid: str) -> Optional[dict]: ...
+    def soft_delete_space(self, tenant: str, space_uid: str) -> bool: ...
+    def apply_resource(self, tenant: str, namespace: str, rtype: str, name: str,
+                       service_object_id: str, managed_by: str) -> dict: ...
+    def find_resource(self, tenant: str, namespace: str, rtype: str, name: str) -> Optional[dict]: ...
+    def delete_resource(self, tenant: str, namespace: str, rtype: str, name: str,
+                        force: bool = False) -> bool: ...
 
 
 def _space_row(req, result) -> dict:
@@ -67,6 +74,42 @@ class InMemoryStore:
         self.runs.append({"space_id": row["id"], "mode": req.mode, "dry_run": req.dry_run,
                           "outcome": result.status, "actor": req.integration_id})
         return row
+
+    def get_space_by_uid(self, tenant, space_uid):
+        for key, row in self.spaces.items():
+            if key[0] == tenant and row.get("space_uid") == space_uid:
+                return {**row, "nodes": self.nodes.get(key, []),
+                        "bindings": self.bindings.get(key, [])}
+        return None
+
+    def soft_delete_space(self, tenant, space_uid):
+        for key, row in self.spaces.items():
+            if key[0] == tenant and row.get("space_uid") == space_uid:
+                row["status"] = "deleted"
+                return True
+        return False
+
+    def apply_resource(self, tenant, namespace, rtype, name, service_object_id, managed_by):
+        rk = (tenant, namespace, rtype, name)
+        rec = self.resources.get(rk, {"ref_count": 0})
+        rec.update({"tenant": tenant, "namespace": namespace, "type": rtype,
+                    "name": name, "service_object_id": service_object_id,
+                    "managed_by": managed_by})
+        self.resources[rk] = rec
+        return rec
+
+    def find_resource(self, tenant, namespace, rtype, name):
+        return self.resources.get((tenant, namespace, rtype, name))
+
+    def delete_resource(self, tenant, namespace, rtype, name, force=False):
+        rk = (tenant, namespace, rtype, name)
+        rec = self.resources.get(rk)
+        if rec is None:
+            return False
+        if rec.get("ref_count", 0) > 0 and not force:
+            return False
+        del self.resources[rk]
+        return True
 
 
 class PgStore:
@@ -141,3 +184,73 @@ class PgStore:
         conn.commit()
         row["id"] = space_id
         return row
+
+    def get_space_by_uid(self, tenant, space_uid):
+        s = schema.schema_name(tenant)
+        conn = self._conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT id, external_id, integration_id, space_uid, blueprint_name, '
+                f'version, status FROM "{s}".provisioned_space WHERE space_uid=%s',
+                (space_uid,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            space_id = r[0]
+            cur.execute(f'SELECT path, uid FROM "{s}".provisioned_node WHERE space_id=%s ORDER BY path',
+                        (space_id,))
+            nodes = [{"path": p, "uid": u} for p, u in cur.fetchall()]
+            cur.execute(f'SELECT ref, folder_uid, fa_binding_id, type FROM "{s}".provisioned_binding WHERE space_id=%s',
+                        (space_id,))
+            bindings = [{"ref": rf, "folder_uid": fu, "binding_id": bid, "type": t}
+                        for rf, fu, bid, t in cur.fetchall()]
+        return {"id": space_id, "external_id": r[1], "integration_id": r[2],
+                "space_uid": r[3], "blueprint_name": r[4], "version": r[5],
+                "status": r[6], "nodes": nodes, "bindings": bindings}
+
+    def soft_delete_space(self, tenant, space_uid):
+        s = schema.schema_name(tenant)
+        conn = self._conn()
+        with conn.cursor() as cur:
+            cur.execute(f'UPDATE "{s}".provisioned_space SET status=%s WHERE space_uid=%s',
+                        ("deleted", space_uid))
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
+
+    def apply_resource(self, tenant, namespace, rtype, name, service_object_id, managed_by):
+        s = schema.schema_name(tenant)
+        conn = self._conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                f'INSERT INTO "{s}".provisioned_resource '
+                f'(tenant, namespace, type, name, service_object_id, managed_by) '
+                f'VALUES (%s,%s,%s,%s,%s,%s) '
+                f'ON CONFLICT (namespace, type, name) DO UPDATE SET '
+                f' service_object_id=EXCLUDED.service_object_id, updated_at=now() RETURNING id',
+                (tenant, namespace, rtype, name, service_object_id, managed_by))
+            rid = cur.fetchone()[0]
+        conn.commit()
+        return {"id": rid, "namespace": namespace, "type": rtype, "name": name,
+                "service_object_id": service_object_id}
+
+    def find_resource(self, tenant, namespace, rtype, name):
+        s = schema.schema_name(tenant)
+        with self._conn().cursor() as cur:
+            cur.execute(
+                f'SELECT service_object_id, ref_count FROM "{s}".provisioned_resource '
+                f'WHERE namespace=%s AND type=%s AND name=%s', (namespace, rtype, name))
+            r = cur.fetchone()
+        return {"service_object_id": r[0], "ref_count": r[1]} if r else None
+
+    def delete_resource(self, tenant, namespace, rtype, name, force=False):
+        s = schema.schema_name(tenant)
+        conn = self._conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                f'DELETE FROM "{s}".provisioned_resource '
+                f'WHERE namespace=%s AND type=%s AND name=%s AND (ref_count=0 OR %s)',
+                (namespace, rtype, name, force))
+            n = cur.rowcount
+        conn.commit()
+        return n > 0
