@@ -98,9 +98,10 @@ without reading the registry DB:
 - `prov_roots: [uid|path, ..]` — root prefix(es) under which spaces may be created.
 - `prov_principals: [pattern, ..]` — role/claim patterns it may grant (e.g.
   `role:project:*`), never `system_admin`.
-- `prov_actions: [type, ..] | "*"` — folder_actions binding types it may configure
-  (`webhook · notify · sorter · move_review · raise_review`), and whether it may set
-  `secret`s. Absent ⇒ no automation setup permitted.
+- `prov_actions: [machine_name, ..] | "*"` — **optional** restriction on which
+  installed folder_action machine names it may configure. **Default `"*"` (any
+  installed action, §5.3);** set a list only to narrow a specific integration. Also
+  gates whether it may set `secret`s.
 Every request is checked against these ceilings **before** any core call; the core
 ACL check is the second, authoritative gate.
 
@@ -229,10 +230,13 @@ constraints; apply/patch calls must satisfy it.
 
 ### 5.3 Automation (`actions`) — per-space folder_actions bindings
 Each entry creates a folder_actions binding on a folder in the tree (by template
-`path`/`ref`), with **parameterized** `config`. Types mirror folder_actions
-(`webhook · notify · sorter · move_review · raise_review`); binding-level
-`on_events` + `mime_types` apply. Every field is `${param}`-substitutable, so the
-same template yields per-project-distinct automation.
+`path`/`ref`), with **parameterized** `config`. `type` is **any installed
+folder_action plug-in, referenced by its machine name** (`type_name`) — the
+built-ins (`webhook · notify · sorter · move_review · raise_review`) *and* any
+custom/future plug-in registered in folder_actions; validated against its live
+`/action-types` (§5.5). Binding-level `on_events` + `mime_types` apply. Every field
+is `${param}`-substitutable, so the same blueprint yields per-project-distinct
+automation.
 
 ```jsonc
 "actions": [
@@ -291,12 +295,17 @@ Provisioning stores only a reference + a hash for drift detection. Rotation goes
 through the setup API (§6.4), not by reading the old value.
 
 ### 5.5 Validation (`templates.py` / `blueprint.py`)
-Referenced params exist and are typed; `principal` params ⊆ `prov_principals`;
-action `type` ∈ the token's `prov_actions`; **every `${node:<path>}` reference
-resolves to a folder declared in the tree** (else the blueprint is rejected — no
-dangling destinations); no cyclic/oversized trees (bounded depth + node count);
-permission letters and event names known; `config` shapes validated against each
-action type's schema (delegated to folder_actions' `/action-types` contract).
+Referenced params exist and are typed; `principal` params ⊆ `prov_principals`
+**and must already exist in the target tenant's directory** — every referenced
+role/claim is validated against LDAP for the tenant and an **unknown role is
+rejected** (provisioning binds to existing roles, never creates them); action
+`type` is **any installed folder_action machine name** (validated against
+folder_actions' live `/action-types`; optionally further restricted by
+`prov_actions`); **every `${node:<path>}` reference resolves to a folder declared in
+the tree** (else rejected — no dangling destinations); no cyclic/oversized trees
+(bounded depth + node count); permission letters and event names known; each
+action's `config` shape is validated against that action type's declared schema
+from `/action-types`.
 
 ### 5.6 Versioning & trackability (stamped on the space root metadata)
 Rather than a stored template version, the integrator passes a **`version`** (their
@@ -360,9 +369,10 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
 - `POST /v1/provisioning/spaces/{space_uid}/grants` — bounded ACL adjustment
   (add/remove a permitted role/claim grant within `prov_principals`), for
   membership-shaped changes not warranting a full re-template.
-- `DELETE /v1/provisioning/spaces/{space_uid}` — **soft-delete** (scope-checked;
-  honors the core's recoverable-delete + versioning); optional, off by default
-  (`PROV_ALLOW_SPACE_DELETE`).
+- `DELETE /v1/provisioning/spaces/{space_uid}` — **soft-delete** (supported in v1;
+  scope-checked; honors the core's recoverable-delete + versioning). Removes the
+  space's tree (recoverably) and its `managed` bindings; the `provisioned_space`
+  record is marked deleted (retained for audit/idempotency).
 
 ### 6.2 Blueprint validation (no stored template library)
 There is **no** template CRUD / stored template store / SPA template editor (§5.0):
@@ -376,10 +386,10 @@ authoring aid only:
 ### 6.3 Per-space configuration & setup API (rich, post-provision customization)
 Beyond one-shot apply, a space's **automation config** is separately inspectable and
 adjustable per project — so an integrator can set/rotate a webhook's context map, a
-notify action's recipients, etc., without re-templating. All bounded by the token's
-`prov_actions`/`prov_principals` and the space's blueprint (only its declared action
-set may be tuned; adding arbitrary action types is not allowed unless the blueprint
-declares them optional).
+notify action's recipients, etc., without re-applying the whole blueprint. Bounded by
+the token's `prov_principals` and (optionally) `prov_actions`; bindings may target
+**any installed folder_action by machine name** (§5.3), and referenced roles must
+exist in the tenant (§5.5). Added/edited bindings are flagged `managed` (§7.1).
 - `GET /v1/provisioning/spaces/{space_uid}/config` — the space's resolved
   automation config: each action `ref`, its folder, bound `binding_id`, `type`,
   `on_events`/`mime_types`, and current param **values with `secret`s redacted**.
@@ -433,9 +443,10 @@ Automation (`actions`) is applied **after** the folder tree, in two steps:
    target folder — is resolved to *this space's* freshly-minted UUID. This is why a
    blueprint can never clone a binding verbatim (§5.3): the UUIDs are space-specific.
 2. **Create/reconcile the binding via folder_actions' API** (`PROV_FOLDER_ACTIONS_URL`,
-   :8099) as the acting integration/admin token: `POST /actions` (create) or
+   :8099) as the acting integration principal: `POST /actions` (create) or
    `PUT /actions/{id}` (update) with the resolved, param-substituted config;
    `PUT /actions/{id}/routes` for sorter routes (destinations resolved likewise).
+   The binding is created **flagged `managed`** (`managed_by = integration_id`, §14a).
    Provisioning records `ref → (folder_uid, binding_id, config_hash)` in
    `provisioned_binding` so reconcile is idempotent and drift is detectable.
 - **Reconcile/enforce:** re-resolve refs against the stable node map and diff each
@@ -447,10 +458,16 @@ Automation (`actions`) is applied **after** the folder tree, in two steps:
   outage leaves folders created and actions pending — a re-apply completes them
   (idempotent). Folder writes and binding creation are **not** one transaction, so the
   engine is designed to converge on retry rather than roll back.
+- **Managed bindings + dual-writer (decision 5).** Provisioned bindings carry a
+  `managed` flag; the official folder_actions admin UI **warns** on a direct edit of a
+  managed binding ("managed by an integration — may be overwritten on the next
+  provisioning sync"). Manual edits are permitted but flagged, and a later `enforce`
+  reconciles the binding back to the blueprint. Needs the small upstream
+  folder_actions `managed_by` addition (§14a).
 - **Boundary note:** configuring folder_actions here is the *programmatic
-  config-service* path (admin/server-to-server), the counterpart of the official
-  client's *interactive* folder_actions admin UI — both are admin surfaces; neither is
-  the end-user embed kit.
+  config-service* path (server-to-server), the counterpart of the official client's
+  *interactive* folder_actions admin UI — both are admin surfaces; neither is the
+  end-user embed kit.
 
 ---
 
@@ -485,7 +502,8 @@ Service-private `PROV_*`:
 - Orchestration: `PROV_FOLDER_ACTIONS_URL` (:8099) + `PROV_FOLDER_ACTIONS_TIMEOUT_S`
   for applying per-space automation bindings (§7.1).
 - Limits: `PROV_MAX_TREE_NODES`, `PROV_MAX_TREE_DEPTH`, `PROV_APPLY_RATE_PER_MIN`
-  (per `integration_id`), `PROV_ALLOW_SPACE_DELETE` (default false).
+  (per `integration_id`), `PROV_ALLOW_SPACE_DELETE` (default **true** — soft-delete
+  is supported (decision 4); set false to disable the DELETE route for a deployment).
 - Monitoring: `PROV_MONITORING_ALLOW_IPS`.
 
 A `.env.example` ships the full surface (copy to `.env`; never commit `.env`).
@@ -545,12 +563,15 @@ Console scripts (`pyproject`): `provisioning-service = provisioning_service.app:
 ## 12. Testing
 
 - **Unit:** template validation + param substitution; plan/diff engine
-  (create/reconcile/enforce, drift); scope enforcement (deny out-of-scope
-  root/template/principal); idempotency (repeat `external_id` → same space).
+  (create/reconcile/enforce, drift); scope enforcement (deny out-of-scope root/
+  principal; reject a role not present in the tenant); idempotency (repeat
+  `external_id` → same space).
 - **Auth:** integration-service vs admin token gating; introspection fallback.
 - **Integration:** against a running dev stack (`scripts/start_backend_services.sh`)
-  — apply a template, assert the folder tree + ACLs + metadata in the core, re-apply
-  (noop), upgrade a version (enforce), dry-run (no writes), audit events emitted.
+  — apply a blueprint, assert the folder tree + ACLs + metadata + `managed`
+  folder_actions bindings (`${node}` destinations resolved) in the core, re-apply
+  (noop), bump version (enforce + re-stamp root metadata), dry-run (no writes),
+  soft-delete, audit events emitted.
 - **Contract:** pin the core ops + audit event shapes; smoke test flags drift from
   the FileEngine gRPC API.
 
@@ -582,24 +603,35 @@ the §14.7 provisioning surface.
 
 ---
 
-## 14. Open decisions
+## 14. Decisions (resolved)
 
-1. **Acting identity** (§3): per-integration principal (default, least-privilege) vs
-   a single provisioning service principal. Confirm the per-integration model is
-   acceptable given it requires the registry to create/grant a service identity on
-   the scoped root at integration registration.
-2. **Version semantics**: `version` is opaque/integrator-owned (default — stamped &
-   echoed, not interpreted). Confirm provisioning need not enforce monotonic upgrade
-   (reject a lower version) — or add an optional guard.
-3. **Role-binding convenience** (§2/§14.7.6): keep role/membership strictly in the
-   shared directory (v1), or add an optional "ensure these role bindings exist" hook
-   later.
-4. **Space deletion**: ship `DELETE` (soft) in v1 or defer (default off).
-5. **Automation ownership model**: bindings a space owns are created/reconciled by
-   provisioning (default). Confirm whether the official folder_actions admin UI may
-   *also* edit those provisioned bindings (dual-writer → drift on next `enforce`), or
-   whether provisioned bindings are marked read-only/managed to avoid conflicting
-   edits.
-6. **Blueprint action set flexibility**: fixed per template (default) vs allowing the
-   setup API (§6.3) to add bindings from an "optional actions" allow-list the
-   blueprint declares. Affects how much post-provision customization is permitted.
+1. **Acting identity — per-integration, least-privilege** (§3). Provisioning acts on
+   the core as the integration's own service principal, bounded by the grants it
+   holds on its scoped root (established at registration). Not a god-mode principal.
+2. **Version — opaque, integrator-owned** (§5.6). Stamped on the root metadata and
+   echoed; never interpreted. No monotonic guard — version discipline (incl. not
+   regressing) is the integrating system's concern.
+3. **Referenced roles must exist in the tenant** (§5.5). Blueprints bind only to
+   roles/claims that **already exist in the target tenant's shared directory**;
+   apply validates every referenced `principal` against LDAP for the tenant and
+   **rejects unknown roles**. Provisioning never creates roles/membership.
+4. **Soft-delete — supported** (§6.1). `DELETE /spaces/{uid}` performs a scope-checked
+   **soft-delete** through the provisioning API (honoring the core's recoverable-
+   delete + versioning). Available in v1.
+5. **Managed automation + edit warning** (§7.1). Provisioned bindings are **flagged
+   `managed`** (by `integration_id`) in folder_actions; the official folder_actions
+   admin UI **raises a warning on direct edits** of a managed binding (a manual edit
+   is allowed but flagged — the next `enforce` will reconcile it back to the
+   blueprint). Requires a small upstream folder_actions addition (§7.1 / §14a).
+6. **Any installed folder_action by machine name** (§5.3). Blueprints may configure
+   **any installed folder_action plug-in, referenced by its machine name**
+   (`type_name`), validated against folder_actions' live `/action-types` set — not a
+   fixed or blueprint-declared subset. `prov_actions` (§3.1) remains an *optional*
+   per-integration restriction; default is "any installed".
+
+### 14a. Upstream dependency (folder_actions) — managed-binding flag
+To support decision 5: add a `managed_by` marker on a folder_actions binding
+(set when provisioning creates/updates it), surfaced in the admin API and used by the
+official SPA to show a **"managed by an integration — edits may be overwritten on the
+next provisioning sync"** warning on the binding editor. Small, additive; the binding
+stays editable (not hard-locked).
