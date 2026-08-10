@@ -105,11 +105,13 @@ provisioning. This service just verifies the resulting bridge JWT:
     Rejected as default because it concentrates privilege and loses core-side
     enforcement.
 
-### 3.0 Deployment model — deployment-wide, multi-tenant integrations
-A FileEngine **deployment is bespoke** to a stack of external application deployments.
-An integration credential is therefore **deployment-wide**, not scoped to a single
-tenant, and the external system is responsible for **spinning up many tenants
-dynamically** — a *fully-integrated tenant provision* per external system.
+### 3.0 Deployment model — bespoke per external SaaS, deployment-wide integration
+**Policy:** FileEngine embedding is **not offered on shared, generic multi-tenant
+instances** — each external SaaS leveraging FileEngine gets its **own bespoke
+deployment**, dedicated to that integrator and itself multi-tenant across *that SaaS's*
+tenants. A deployment therefore normally serves **one integration**, which is
+**deployment-wide** (not scoped to a single tenant) and is responsible for **spinning
+up many tenants dynamically** — a *fully-integrated tenant provision* per tenant.
 - **New tenant = LDAP OU (external app) → adopt (FileEngine).** The external app
   creates the tenant's OU structure in the **shared LDAP** (Posture B); provisioning
   then validates + adopts it (§3.2) and applies that tenant's blueprints/resources.
@@ -118,10 +120,10 @@ dynamically** — a *fully-integrated tenant provision* per external system.
   tenant in the deployment) because tenants are created on the fly; each request's
   tenant is still LDAP-validated (§3.2). `prov_roots`/`prov_namespace` scope *within*
   each tenant.
-- **One (or few) integrations per deployment.** Since the deployment is dedicated to
-  the integration's external-app stack, there is typically one integration (or a small
-  set); the per-integration `prov_namespace` still keeps their tenant-scoped resources
-  from colliding.
+- **Normally one integration per deployment.** The deployment is bespoke to a single
+  external SaaS, so there is typically **one** integration; the per-integration
+  `prov_namespace` is kept for robustness (and any secondary integration) but rarely
+  contends.
 
 ### 3.1 Scope claims (carried by the integration-service token)
 Minted by the exchange endpoint from the registry (§14.1) so this service enforces
