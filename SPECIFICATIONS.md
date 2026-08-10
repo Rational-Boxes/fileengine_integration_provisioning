@@ -31,26 +31,26 @@ Integrator backend  ──(integration-service token, §14.2)──▶  Provisio
                                                                 ├─ gRPC to core as the integration principal (mkdir / grant / metadata)
                                                                 ├─ REST to folder_actions (:8099): per-space automation bindings (§7.1)
                                                                 └─ Redis: emit provisioning.* audit events
-Official SPA (admin) ──(admin JWT)──▶ template CRUD (System config → Provisioning)
+(No stored templates: the integrator passes a rich inline blueprint per call, see 5.0.)
 ```
 
 - **Callers.** The integrator's *backend* (or a trusted orchestrator), never the
   browser or the embed kit. Requests carry an **integration-service token** (§14.2:
   `sub = integration_id`, `amr:["integration"]`, `provisioning` capability, scope
-  claims). Template authoring is admin, carrying a normal admin bridge JWT.
+  claims). Blueprints are authored in the integrator's own system and passed inline (§5.0); no admin authoring surface here.
 - **Depends on** (upstream, embedding-kit §14): the integration **registry** +
   credential UI (§14.1, ldap_manager) and the **exchange endpoint** (§14.2,
   http_bridge) that mints the integration-service token. This service **consumes**
   those tokens; it does not mint them.
 - **Writes go through the core** (gRPC via `python_interface`), so all existing
   ACL, versioning, tenancy, and audit invariants hold unchanged. This service adds
-  orchestration + a template/idempotency store, not a new write path.
+  orchestration + a blueprint-snapshot / idempotency store, not a new write path.
 
 ---
 
 ## 2. Scope boundary (what this service does / does not do)
 
-**Does:** template storage + validation; declarative space **apply/reconcile**;
+**Does:** blueprint validation; declarative space **apply/reconcile**;
 idempotent project provisioning keyed by the integrator's `external_id`; drift
 inspection; scope enforcement; `provisioning.*` audit.
 
@@ -77,7 +77,7 @@ Mirrors the lane's auth stack (`jwt_verify.py` + `bridge_auth.py` + `http_auth.p
   - **Integration-service token** (space ops) — must carry `amr:["integration"]`,
     the `provisioning` capability, and the **scope claims** (§3.1). Enforced by
     `require_integration(scope=...)`.
-  - **Admin bridge JWT** (template CRUD) — normal tenant-admin, enforced by
+  - **Admin bridge JWT** (manual ops / validate; optional) — normal tenant-admin, enforced by
     `require_admin`.
 - **Acting on the core — as the integration principal.** For each apply, the
   service constructs a `CoreClient` bound to the **integration's service identity**
@@ -151,7 +151,7 @@ Owns its own database (`PROV_PG_*`, default DB `provisioning`), per-tenant schem
   root metadata, §5.6), `last_blueprint` JSONB (snapshot of the last applied
   document, for reconcile/drift), `params` JSONB (secrets redacted), `status`,
   `created_at`, `last_applied_at`.
-- **`provisioned_node`** — template-path → core `uid` map for a space (so reconcile
+- **`provisioned_node`** — blueprint-path → core `uid` map for a space (so reconcile
   is stable across runs, drift can be computed, and `${node:<path>}` references
   resolve): `space_id`, `path`, `uid`, `kind`, `created_at`.
 - **`provisioned_binding`** — the space's automation map: `space_id`, `ref`,
@@ -200,7 +200,7 @@ constraints; apply/patch calls must satisfy it.
   - **`principal`** must match the token's `prov_principals`; **`ref`** points at an
     existing object (e.g. a `classifier_set_id`).
 - Referenced by `${param}` (scalars) or whole-value injection for `map`/`list`.
-- **`${node:<template-path>}`** — a **symbolic folder reference** resolved at apply
+- **`${node:<blueprint-path>}`** — a **symbolic folder reference** resolved at apply
   time to *this space's* freshly-minted folder UUID (§5.3). Any folder reference in
   an action's config (sorter route destinations, `move_review` on_approved/on_rejected,
   webhook `move_to`) MUST use this token — **never a literal UUID**, which would point
@@ -229,7 +229,7 @@ constraints; apply/patch calls must satisfy it.
   letter vocabulary (`r w d l u v b s m i …`).
 
 ### 5.3 Automation (`actions`) — per-space folder_actions bindings
-Each entry creates a folder_actions binding on a folder in the tree (by template
+Each entry creates a folder_actions binding on a folder in the tree (by blueprint
 `path`/`ref`), with **parameterized** `config`. `type` is **any installed
 folder_action plug-in, referenced by its machine name** (`type_name`) — the
 built-ins (`webhook · notify · sorter · move_review · raise_review`) *and* any
@@ -294,7 +294,7 @@ forwarded once to folder_actions, which encrypts them at rest (its `secrets.py`)
 Provisioning stores only a reference + a hash for drift detection. Rotation goes
 through the setup API (§6.4), not by reading the old value.
 
-### 5.5 Validation (`templates.py` / `blueprint.py`)
+### 5.5 Validation (`blueprint.py`)
 Referenced params exist and are typed; `principal` params ⊆ `prov_principals`
 **and must already exist in the target tenant's directory** — every referenced
 role/claim is validated against LDAP for the tenant and an **unknown role is
@@ -336,7 +336,7 @@ space and any client can inspect it:
 ## 6. API surface
 
 Base path `/v1/provisioning`. All routes require auth (§3). Space routes require an
-**integration-service token**; template routes require **admin**.
+**integration-service token**; the /blueprints/validate aid (§6.2) accepts an integration or admin token.
 
 ### 6.1 Spaces (integration-driven)
 - `POST /v1/provisioning/spaces` — the **integration endpoint**: apply an **inline
@@ -363,12 +363,12 @@ Base path `/v1/provisioning`. All routes require auth (§3). Space routes requir
     uid, action}], actions:[{ref, folder_uid, binding_id, action}], warnings:[...] }`.
 - `GET /v1/provisioning/spaces?tenant=&external_id=&blueprint_name=` — list within scope.
 - `GET /v1/provisioning/spaces/{space_uid}` — inspect: node map, applied
-  template+version, and **drift** vs the current template.
+  blueprint name+version, and **drift** vs the last-applied blueprint.
 - `PATCH /v1/provisioning/spaces/{space_uid}` — re-apply / upgrade to a newer
-  template version (reconcile|enforce), or update params.
+  blueprint/version (reconcile|enforce), or update params.
 - `POST /v1/provisioning/spaces/{space_uid}/grants` — bounded ACL adjustment
   (add/remove a permitted role/claim grant within `prov_principals`), for
-  membership-shaped changes not warranting a full re-template.
+  membership-shaped changes not warranting a full re-apply.
 - `DELETE /v1/provisioning/spaces/{space_uid}` — **soft-delete** (supported in v1;
   scope-checked; honors the core's recoverable-delete + versioning). Removes the
   space's tree (recoverably) and its `managed` bindings; the `provisioned_space`
@@ -429,7 +429,7 @@ per the platform monitoring convention. Not on the public surface.
 - **Resumable, reported.** A multi-node apply persists the node map as it goes and
   returns a per-node report; a mid-apply failure leaves a consistent state that a
   re-apply completes. `dry_run` returns the plan without writing.
-- **Drift** (inspect) surfaces divergence from the template so an operator or the
+- **Drift** (inspect) surfaces divergence from the blueprint so an operator or the
   integration can choose to `enforce`.
 - **Core operations used** (via `core_client.py` → `python_interface`): `make_dir`,
   `grant_permission`/`revoke_permission`, `set_metadata` — each ACL-checked by the
@@ -523,7 +523,7 @@ commercial_provisioning/
     ├── config.py                 # Config from env (FILEENGINE_* + PROV_*)
     ├── app.py                    # FastAPI factory + CORS + monitoring + main()
     ├── deps.py                   # require_integration(scope) / require_admin
-    ├── api.py                    # space + template routers (§6)
+    ├── api.py                    # space + blueprint/setup routers (§6)
     ├── jwt_verify.py             # local HS256 verify (shared secret)
     ├── bridge_auth.py            # introspection fallback
     ├── http_auth.py             # bearer extraction + token-type checks
@@ -532,7 +532,7 @@ commercial_provisioning/
     ├── core_client.py            # CoreClient acting as the integration principal
     ├── schema.py                 # per-tenant DDL (§4) + ensure_tenant_schema
     ├── db.py / stores.py         # Postgres access (templates, spaces, node map, runs)
-    ├── templates.py              # template parse/validate + param substitution
+    ├── blueprint.py               # blueprint parse/validate + param substitution
     ├── engine.py                 # plan → apply/reconcile/enforce + drift
     ├── audit.py                  # provisioning.* Redis emit
     ├── reconcile.py              # optional periodic drift sweep (console script)
@@ -562,7 +562,7 @@ Console scripts (`pyproject`): `provisioning-service = provisioning_service.app:
 
 ## 12. Testing
 
-- **Unit:** template validation + param substitution; plan/diff engine
+- **Unit:** blueprint validation + param substitution; plan/diff engine
   (create/reconcile/enforce, drift); scope enforcement (deny out-of-scope root/
   principal; reject a role not present in the tenant); idempotency (repeat
   `external_id` → same space).
