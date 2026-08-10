@@ -4,10 +4,11 @@ A standalone **AGPL** FastAPI service lane that implements the **embedding
 provisioning API surface** (§14.7 of the commercial embedding kit): a
 server-to-server API for an embedding application to **stand up and maintain the
 project spaces it needs** — standardized "project"/space folder trees with owners,
-roles, ACLs, metadata, **and per-space automation** (folder_actions bindings:
-webhooks, notify, sorter, review chains — each customized per project) already
+roles, ACLs, metadata, **per-space automation** (folder_actions bindings: webhooks,
+notify, sorter, review chains — each customized per project), **and the tenant-scoped
+configs those depend on** (classifier sets, notify templates — extensible) already
 applied — so end users then simply operate within correctly-permissioned,
-correctly-wired spaces. It is a **rich setup API**, not a static folder clone.
+correctly-wired spaces. It is a **rich, self-contained setup API**, not a folder clone.
 
 Follows the established FileEngine FastAPI service-lane conventions (as
 `folder_actions`, `discussion`, `convert_search_ai`, `bcf_service`): `src/` layout,
@@ -50,9 +51,10 @@ Integrator backend  ──(integration-service token, §14.2)──▶  Provisio
 
 ## 2. Scope boundary (what this service does / does not do)
 
-**Does:** blueprint validation; declarative space **apply/reconcile**;
-idempotent project provisioning keyed by the integrator's `external_id`; drift
-inspection; scope enforcement; `provisioning.*` audit.
+**Does:** blueprint validation; declarative space **apply/reconcile** (folders + ACL +
+metadata + automation); creation of **tenant-scoped dependent resources** (classifier
+sets, notify templates, extensible; §5.8); idempotent project provisioning keyed by the
+integrator's `external_id`; drift inspection; scope enforcement; `provisioning.*` audit.
 
 **Does not:** manage identity or tenant lifecycle. Creating roles/groups and
 managing membership stays in the shared LDAP source-of-truth (the integrator writes
@@ -109,6 +111,9 @@ without reading the registry DB:
   installed folder_action machine names it may configure. **Default `"*"` (any
   installed action, §5.3);** set a list only to narrow a specific integration. Also
   gates whether it may set `secret`s.
+- `prov_resources: [type, ..] | "*"` — **optional** restriction on which tenant-scoped
+  resource types it may create (`classifier_set`, `notify_template`, …; §5.8). Default
+  `"*"` (any registered resource handler).
 Every request is checked against these ceilings **before** any core call; the core
 ACL check is the second, authoritative gate.
 
@@ -165,6 +170,11 @@ Owns its own database (`PROV_PG_*`, default DB `provisioning`), per-tenant schem
   `folder_uid`, `fa_binding_id` (folder_actions id), `type`, `config_hash`,
   `secret_refs`, `created/updated_at`. Backs idempotent reconcile of actions and
   drift detection; holds **no raw secrets** (§5.4).
+- **`provisioned_resource`** — tenant-scoped dependent configs (§5.8), keyed by
+  **(tenant, type, name)** (not per-space): `tenant`, `type`, `name`, `owning_service`,
+  `service_object_id` (e.g. classifier_set id / template id), `config_hash`,
+  `managed_by`, `ref_count` (spaces referencing it), `created/updated_at`. Backs
+  idempotent reconcile + independent lifecycle.
 - **`apply_run`** — per-apply log (audit companion): `space_id`, `mode`, `dry_run`,
   `outcome`, `report` JSONB (per-node actions/warnings), `actor` (integration_id),
   `ts`.
@@ -212,6 +222,11 @@ constraints; apply/patch calls must satisfy it.
   an action's config (sorter route destinations, `move_review` on_approved/on_rejected,
   webhook `move_to`) MUST use this token — **never a literal UUID**, which would point
   at another space or nothing.
+- **`${resource:<ref>}`** — a reference to a **tenant-scoped dependent resource** (a
+  classifier set, notify template, …) declared in the blueprint's `resources` section
+  (§5.8), resolved at apply time to that resource's id (e.g. a sorter's
+  `classifier_set_id`, a notify action's `template`). Guarantees the referenced config
+  exists before the action that needs it.
 
 ### 5.2 Structure (root / children / acls / metadata)
 ```jsonc
@@ -366,6 +381,62 @@ that they're editing configuration owned by an integration.
   them. Clearing them (un-manage) is a provisioning operation (e.g. soft-delete /
   a future "release" op), not an ad-hoc metadata edit.
 
+### 5.8 Tenant-scoped dependent resources (classifier sets, notify templates, …)
+
+Automation bindings depend on **tenant-scoped configuration objects** that must exist
+before a binding can reference them — a sorter's **classifier set**, a notify action's
+**notify template**, and more to come. Provisioning therefore creates these too, so a
+blueprint yields a **self-contained** project setup rather than assuming pre-existing
+config.
+
+**Declared in the blueprint `resources` section** (parameterizable like everything
+else); actions reference them by `${resource:<ref>}` (§5.1):
+```jsonc
+"resources": [
+  { "type": "classifier_set", "ref": "mfg",     "name": "${project_code}-mfg",
+    "body": { /* classifier set def: classifiers/terms/weights (folder_actions YAML/JSON) */ } },
+  { "type": "notify_template", "ref": "approved", "name": "${project_code}-approved",
+    "body": { "subject": "${project_code} approved", "html": "…", "text": "…" } }
+],
+"actions": [
+  { "ref": "auto-sort", "folder": "${project_code}", "type": "sorter",
+    "config": { "classifier_set_id": "${resource:mfg}" } },
+  { "ref": "notify-approved", "folder": "Approved", "type": "notify",
+    "config": { "template": "${resource:approved}", "recipients": "${notify_recipients}" } }
+]
+```
+
+- **Tenant-scoped, not per-space.** Resources live at the **tenant** level and may be
+  shared by many spaces. Idempotent by **(tenant, type, name)** — re-declaring
+  reconciles the same object; two spaces referencing the same named set share one.
+  (This differs from spaces, which key on `external_id`.)
+- **Created before actions.** Apply order is **resources → folders → ACL/metadata →
+  actions**, so `${resource:...}` always resolves to an existing id when a binding is
+  wired (§7).
+- **Owned by their service; created via that service's API.** Classifier sets and
+  notify templates are **folder_actions** objects (`/classifier-sets`,
+  `/notify-templates`) — provisioning orchestrates folder_actions (already in the data
+  path, §7.1) to create/reconcile them. Because these are admin config objects,
+  creating them is the *programmatic config-service* path (consistent with the
+  boundary), the counterpart of the official client's classifier/template editors.
+- **Marked managed.** Provisioned resources carry the `managed_by` marker so the admin
+  editors warn (§5.7); since they are **service-owned objects, not nodes**, the marker
+  is a `managed_by` **field on the object record** rather than node metadata — a small
+  additive field on folder_actions' classifier-set / notify-template models (§14a).
+- **Lifecycle is independent of spaces.** A shared tenant resource is **not** deleted
+  when one referencing space is soft-deleted (others may use it); resource lifecycle is
+  its own `POST/DELETE /resources` concern (§6) plus reference-counting.
+
+**Extensible — a resource-handler registry (the extension point).** Provisioning does
+not hardcode the config types. Each `type` maps to a **resource handler** that declares
+its owning service and how to **create / reconcile / diff (hash) / delete** that object
+via the owning service's API. Built-in handlers: `classifier_set`, `notify_template`
+(→ folder_actions). **Future dependent-config types** (e.g. other services'
+tenant-scoped configs) are added by **registering a new handler** — the blueprint schema
+and apply engine stay generic. This mirrors "any installed folder_action by machine
+name" (§5.3): the *set of resource types* is provisioning's extension surface, gated per
+integration by `prov_resources` (§3.1).
+
 ---
 
 ## 6. API surface
@@ -441,7 +512,22 @@ admin UIs flag them as externally managed.
   param for an action; forwarded to folder_actions' encrypted store, never persisted
   raw here (§5.4).
 
-### 6.4 Monitoring (loopback-only, unauthenticated)
+### 6.4 Tenant resources (dependent configs — classifier sets, notify templates, …)
+Tenant-scoped resources (§5.8) are normally created *inline* via a blueprint's
+`resources` section on `POST /spaces`, but they also have a **standalone** API for
+managing tenant-level config not tied to a single space (idempotent by
+`(tenant, type, name)`, scoped by `prov_resources`):
+- `POST /v1/provisioning/resources` — create/reconcile a resource
+  `{ tenant, type, name, body }` → `{ type, name, service_object_id, status }`.
+- `GET /v1/provisioning/resources?tenant=&type=` — list within scope.
+- `GET /v1/provisioning/resources/{type}/{name}` — inspect (+ drift vs `body`).
+- `PATCH /v1/provisioning/resources/{type}/{name}` — reconcile/enforce to a new `body`.
+- `DELETE /v1/provisioning/resources/{type}/{name}` — remove **only if `ref_count`=0**
+  (no space still references it), unless `force`. Honors the owning service's delete.
+All operations dispatch through the **resource-handler registry** (§5.8) to the owning
+service (folder_actions for the built-ins), and mark the object `managed_by` (§14a).
+
+### 6.5 Monitoring (loopback-only, unauthenticated)
 `/healthz`, `/readyz`, `/poolz` bound to loopback / `PROV_MONITORING_ALLOW_IPS`,
 per the platform monitoring convention. Not on the public surface.
 
@@ -452,6 +538,12 @@ per the platform monitoring convention. Not on the public surface.
 - **Resolve tenant first (§3.2).** Validate the request tenant against LDAP and boot
   its metadata (reject `tenant_not_initialized` if the OU is absent); the core
   materializes the tenant lazily on the first write. Only then plan/apply.
+- **Apply order: resources → folders → ACL/metadata → actions.** Tenant-scoped
+  `resources` (§5.8) are created/reconciled **first** (via their handlers), yielding the
+  ids that `${resource:...}` references resolve to; then the folder tree + ACL/metadata;
+  then the automation bindings (which now have both `${node:...}` and `${resource:...}`
+  resolved). This ordering guarantees no binding is wired to a not-yet-existing
+  classifier set or template.
 - **Plan → apply.** Parse the inline `blueprint`, substitute `params`, and compute a
   **plan**: the desired node tree + ACL/metadata + actions. Diff against
   `provisioned_node`/`provisioned_binding` (existing maps) + live state to classify
@@ -516,8 +608,9 @@ attributable. Events, each `{ integration_id, tenant, blueprint_name, version,
 space_uid, external_id, mode, outcome, source_ip }`:
 - `provisioning.space_applied`, `provisioning.space_reconciled`,
   `provisioning.space_deleted`, `provisioning.action_configured` (binding
-  create/update, secret rotate — secrets redacted), and (admin)
-  `provisioning.template_changed`.
+  create/update, secret rotate — secrets redacted), and
+  `provisioning.resource_applied` (tenant-scoped classifier set / notify template
+  create/reconcile/delete, §5.8).
 Rejections (scope/authz failures) are emitted too, as security signals.
 
 ---
@@ -571,7 +664,8 @@ commercial_provisioning/
     ├── schema.py                 # per-tenant DDL (§4) + ensure_tenant_schema
     ├── db.py / stores.py         # Postgres access (templates, spaces, node map, runs)
     ├── blueprint.py               # blueprint parse/validate + param substitution
-    ├── engine.py                 # plan → apply/reconcile/enforce + drift
+    ├── engine.py                 # plan → apply/reconcile/enforce + drift (order: resources→folders→actions)
+    ├── resources.py              # tenant-resource handler registry (classifier_set, notify_template, …)
     ├── audit.py                  # provisioning.* Redis emit
     ├── reconcile.py              # optional periodic drift sweep (console script)
     └── netutil.py / failover.py  # request IP + replica helpers
@@ -627,10 +721,13 @@ Console scripts (`pyproject`): `provisioning-service = provisioning_service.app:
    idempotency by `external_id`, node map, core mkdir/grant/metadata as the
    integration principal, `provisioning.*` audit. First usable release (folders +
    ACL + metadata).
-4. **P3 — Automation & setup (the rich part).** `actions` in the blueprint;
-   `${node:...}` resolution; folder_actions orchestration (§7.1) incl. sorter routes
-   + secrets; the per-space configuration/setup API (§6.3); `provisioned_binding`
-   store + reconcile. This is what makes provisioning more than a folder clone.
+4. **P3 — Automation, resources & setup (the rich part).** `resources` (§5.8) via the
+   resource-handler registry (classifier_set + notify_template → folder_actions),
+   `${resource:...}` resolution, `provisioned_resource` store + `/resources` API;
+   `actions` in the blueprint; `${node:...}` resolution; folder_actions orchestration
+   (§7.1) incl. sorter routes + secrets; the per-space configuration/setup API (§6.3);
+   `provisioned_binding` store + reconcile; the `managed_by` marker (§5.7/§14a). This is
+   what makes provisioning a full, self-contained project setup, not a folder clone.
 5. **P4 — Enforce + drift + dry-run + grants + soft-delete** (over structure *and*
    actions).
 6. **P5 — Hardening.** rate-limits, reconcile sweep, docs/examples (blueprint
@@ -667,6 +764,12 @@ the §14.7 provisioning surface.
    (`type_name`), validated against folder_actions' live `/action-types` set — not a
    fixed or blueprint-declared subset. `prov_actions` (§3.1) remains an *optional*
    per-integration restriction; default is "any installed".
+7. **Tenant-scoped dependent resources** (§5.8) — resolved: provisioning creates them
+   (classifier sets, notify templates) via an **extensible resource-handler registry**,
+   keyed `(tenant, type, name)`, referenced by `${resource:...}`, created before
+   actions. *Still open:* cross-integration **name-collision** policy (namespace names
+   per integration, e.g. a required prefix, vs first-writer-owns) and the exact
+   **ref-count / GC** policy when the last referencing space is deleted.
 
 ### 14a. Upstream dependency (frontend) — honor the `managed_by` metadata key
 Decision 5 is satisfied by a **frontend** convention, not a backend schema change:
@@ -680,4 +783,13 @@ Decision 5 is satisfied by a **frontend** convention, not a backend schema chang
   and ACL/metadata panels. Advisory only — editing stays enabled.
 - Reserve `managed_by` (+ the `provision.*` namespace) as well-known keys across the
   platform so the marker is honored consistently, not just for folder_actions.
-Small, additive, and reusable for any future externally-managed configuration.
+
+**Service-owned config objects (not nodes).** Tenant-scoped resources (§5.8) —
+classifier sets, notify templates — are **folder_actions records, not core nodes**, so
+node metadata doesn't apply. For these, `managed_by` is a small additive **field on the
+object model** (folder_actions `classifier_set` / `notify_template`), surfaced in its
+admin API and honored by the classifier/template editors with the same "externally
+managed — may be overwritten on next sync" warning. This is the one small backend
+addition (a nullable `managed_by` column on those two config tables); bindings and
+folders still use the node-metadata key (no binding schema change). Both future dependent
+resource types should follow the same `managed_by`-field convention.
