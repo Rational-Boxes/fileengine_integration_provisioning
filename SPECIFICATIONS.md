@@ -320,7 +320,8 @@ own version of the provisioning structure) on each apply. Provisioning **stamps 
 onto the space root folder's metadata** in the core, so the version travels with the
 space and any client can inspect it:
 - Root metadata keys written on apply: `provision.name`, `provision.version`,
-  `provision.integration_id`, `provision.external_id`, `provision.applied_at`.
+  `provision.integration_id`, `provision.external_id`, `provision.applied_at`, and the
+  well-known **`managed_by`** key (§5.7).
 - **The embedder inspects** the root's metadata (`GET /v1/nodes/{root}/metadata`) to
   learn which generation of the provisioning structure a space is on, and decides
   whether to trigger an upgrade (the integrator re-applies a newer blueprint + higher
@@ -337,6 +338,33 @@ space and any client can inspect it:
   never proactively upgrades or scans for out-of-date spaces — it applies what it is
   told and records the result. (The optional `reconcile.py` sweep is for *internal
   drift* — e.g. a binding manually changed — not version migration.)
+
+### 5.7 `managed_by` — a well-known metadata key (externally-managed marker)
+
+`managed_by` is a **reserved, well-known node-metadata key** — a platform convention,
+not a provisioning- or folder_actions-specific field — that marks a resource as
+**externally managed**, so any **administrative UI can flag it** and warn an operator
+that they're editing configuration owned by an integration.
+
+- **Written by provisioning** (via the core metadata API) on **every folder it
+  creates** (root and children), value = the managing `integration_id` (a stable
+  identifier; the `provision.*` keys carry the details — blueprint name, version,
+  external_id). Cheap — provisioning is creating those folders anyway.
+- **Honored by administrative UIs** (decision 5, §14a). The official client reads
+  `managed_by` off a node's metadata and shows an **"externally managed by
+  `<integration>` — changes may be overwritten on the next provisioning sync"** badge/
+  warning — in the folder_actions binding editor (a binding lives on a folder that
+  carries the key), the file-details drawer, and any config surface. Editing stays
+  allowed (not hard-locked); the warning is advisory, and a later `enforce`
+  reconciles.
+- **Scope of the flag.** Because it sits on the folder(s), it naturally covers both
+  the **structure** and the **automation** attached to those folders — no separate
+  per-binding field is needed. A UI may check the node itself and, for robustness,
+  walk ancestors (a child of a managed space is managed).
+- **Reserved key.** `managed_by` (and the `provision.*` namespace) are reserved
+  well-known keys; blueprints/users should not set them by hand — provisioning owns
+  them. Clearing them (un-manage) is a provisioning operation (e.g. soft-delete /
+  a future "release" op), not an ad-hoc metadata edit.
 
 ---
 
@@ -396,7 +424,8 @@ adjustable per project — so an integrator can set/rotate a webhook's context m
 notify action's recipients, etc., without re-applying the whole blueprint. Bounded by
 the token's `prov_principals` and (optionally) `prov_actions`; bindings may target
 **any installed folder_action by machine name** (§5.3), and referenced roles must
-exist in the tenant (§5.5). Added/edited bindings are flagged `managed` (§7.1).
+exist in the tenant (§5.5). Their folders carry the `managed_by` marker (§5.7), so
+admin UIs flag them as externally managed.
 - `GET /v1/provisioning/spaces/{space_uid}/config` — the space's resolved
   automation config: each action `ref`, its folder, bound `binding_id`, `type`,
   `on_events`/`mime_types`, and current param **values with `secret`s redacted**.
@@ -453,7 +482,8 @@ Automation (`actions`) is applied **after** the folder tree, in two steps:
    :8099) as the acting integration principal: `POST /actions` (create) or
    `PUT /actions/{id}` (update) with the resolved, param-substituted config;
    `PUT /actions/{id}/routes` for sorter routes (destinations resolved likewise).
-   The binding is created **flagged `managed`** (`managed_by = integration_id`, §14a).
+   The binding lives on a folder that carries the well-known **`managed_by`** metadata
+   key (§5.7), which is how admin UIs flag it as externally managed (§14a).
    Provisioning records `ref → (folder_uid, binding_id, config_hash)` in
    `provisioned_binding` so reconcile is idempotent and drift is detectable.
 - **Reconcile/enforce:** re-resolve refs against the stable node map and diff each
@@ -465,12 +495,13 @@ Automation (`actions`) is applied **after** the folder tree, in two steps:
   outage leaves folders created and actions pending — a re-apply completes them
   (idempotent). Folder writes and binding creation are **not** one transaction, so the
   engine is designed to converge on retry rather than roll back.
-- **Managed bindings + dual-writer (decision 5).** Provisioned bindings carry a
-  `managed` flag; the official folder_actions admin UI **warns** on a direct edit of a
-  managed binding ("managed by an integration — may be overwritten on the next
-  provisioning sync"). Manual edits are permitted but flagged, and a later `enforce`
-  reconciles the binding back to the blueprint. Needs the small upstream
-  folder_actions `managed_by` addition (§14a).
+- **Managed marker + dual-writer (decision 5).** The provisioned folders carry the
+  well-known **`managed_by`** metadata key (§5.7); the folder_actions admin UI (and
+  other config surfaces) read it and **warn** on a direct edit ("externally managed by
+  `<integration>` — may be overwritten on the next provisioning sync"). Manual edits
+  are permitted but flagged, and a later `enforce` reconciles config back to the
+  blueprint. Because the marker is node metadata on the folder, **no folder_actions
+  schema change is needed** — only that admin UIs honor the key (§14a).
 - **Boundary note:** configuring folder_actions here is the *programmatic
   config-service* path (server-to-server), the counterpart of the official client's
   *interactive* folder_actions admin UI — both are admin surfaces; neither is the
@@ -625,20 +656,28 @@ the §14.7 provisioning surface.
 4. **Soft-delete — supported** (§6.1). `DELETE /spaces/{uid}` performs a scope-checked
    **soft-delete** through the provisioning API (honoring the core's recoverable-
    delete + versioning). Available in v1.
-5. **Managed automation + edit warning** (§7.1). Provisioned bindings are **flagged
-   `managed`** (by `integration_id`) in folder_actions; the official folder_actions
-   admin UI **raises a warning on direct edits** of a managed binding (a manual edit
-   is allowed but flagged — the next `enforce` will reconcile it back to the
-   blueprint). Requires a small upstream folder_actions addition (§7.1 / §14a).
+5. **Managed marker via the well-known `managed_by` metadata key** (§5.7). Provisioned
+   folders carry a reserved **`managed_by`** node-metadata key (value = `integration_id`);
+   admin UIs read it and warn that the configuration is externally managed (a manual
+   edit is allowed but flagged — the next `enforce` reconciles). It is a **platform
+   metadata convention**, so **no folder_actions schema change** — only that admin UIs
+   honor the key (§14a).
 6. **Any installed folder_action by machine name** (§5.3). Blueprints may configure
    **any installed folder_action plug-in, referenced by its machine name**
    (`type_name`), validated against folder_actions' live `/action-types` set — not a
    fixed or blueprint-declared subset. `prov_actions` (§3.1) remains an *optional*
    per-integration restriction; default is "any installed".
 
-### 14a. Upstream dependency (folder_actions) — managed-binding flag
-To support decision 5: add a `managed_by` marker on a folder_actions binding
-(set when provisioning creates/updates it), surfaced in the admin API and used by the
-official SPA to show a **"managed by an integration — edits may be overwritten on the
-next provisioning sync"** warning on the binding editor. Small, additive; the binding
-stays editable (not hard-locked).
+### 14a. Upstream dependency (frontend) — honor the `managed_by` metadata key
+Decision 5 is satisfied by a **frontend** convention, not a backend schema change:
+- **Provisioning** stamps the well-known **`managed_by`** node-metadata key (§5.7) on
+  the folders it creates — using the existing core metadata API (no new endpoint).
+- **The official client** reads `managed_by` off a node's metadata (it already fetches
+  node metadata for the details drawer) and shows an **"externally managed by
+  `<integration>` — changes may be overwritten on the next provisioning sync"** badge/
+  warning wherever an admin edits that node's configuration: the **folder_actions
+  binding editor** (`BindingEditor`/`FolderActionsPanel`), the file-details drawer,
+  and ACL/metadata panels. Advisory only — editing stays enabled.
+- Reserve `managed_by` (+ the `provision.*` namespace) as well-known keys across the
+  platform so the marker is honored consistently, not just for folder_actions.
+Small, additive, and reusable for any future externally-managed configuration.
