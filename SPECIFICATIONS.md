@@ -114,6 +114,11 @@ without reading the registry DB:
 - `prov_resources: [type, ..] | "*"` — **optional** restriction on which tenant-scoped
   resource types it may create (`classifier_set`, `notify_template`, …; §5.8). Default
   `"*"` (any registered resource handler).
+- `prov_namespace: <prefix>` — the **namespace prefix bound to this integration
+  credential** at registration (§14.1). Provisioning prefixes every tenant-scoped
+  resource it creates with it (`<prefix>/<name>`) and confines the integration to its
+  own namespace, so integrations never collide on a shared resource name. Authoritative
+  (from the registry), not settable by the caller.
 Every request is checked against these ceilings **before** any core call; the core
 ACL check is the second, authoritative gate.
 
@@ -171,10 +176,12 @@ Owns its own database (`PROV_PG_*`, default DB `provisioning`), per-tenant schem
   `secret_refs`, `created/updated_at`. Backs idempotent reconcile of actions and
   drift detection; holds **no raw secrets** (§5.4).
 - **`provisioned_resource`** — tenant-scoped dependent configs (§5.8), keyed by
-  **(tenant, type, name)** (not per-space): `tenant`, `type`, `name`, `owning_service`,
+  **(tenant, namespace, type, name)** (not per-space): `tenant`, `namespace` (the
+  integration's bound prefix, §3.1), `type`, `name`, `owning_service`,
   `service_object_id` (e.g. classifier_set id / template id), `config_hash`,
   `managed_by`, `ref_count` (spaces referencing it), `created/updated_at`. Backs
-  idempotent reconcile + independent lifecycle.
+  idempotent reconcile + independent lifecycle; the namespace prevents cross-integration
+  name collisions.
 - **`apply_run`** — per-apply log (audit companion): `space_id`, `mode`, `dry_run`,
   `outcome`, `report` JSONB (per-node actions/warnings), `actor` (integration_id),
   `ts`.
@@ -406,10 +413,16 @@ else); actions reference them by `${resource:<ref>}` (§5.1):
 ]
 ```
 
-- **Tenant-scoped, not per-space.** Resources live at the **tenant** level and may be
-  shared by many spaces. Idempotent by **(tenant, type, name)** — re-declaring
-  reconciles the same object; two spaces referencing the same named set share one.
-  (This differs from spaces, which key on `external_id`.)
+- **Tenant-scoped + integration-namespaced.** Resources live at the **tenant** level
+  and may be shared by many spaces of the **same integration**. Their identity is
+  **(tenant, integration namespace, type, name)** — the **namespace** is assigned to
+  the integration when its credentials are created (§14.1) and carried in the token as
+  `prov_namespace` (§3.1); the integration cannot set or spoof it. This prevents
+  cross-integration collisions on a shared name (`mfg`), scopes an integration to *its
+  own* resources, and makes reconcile deterministic. The `name` an integration writes
+  is implicitly within its namespace; the underlying folder_actions object is created
+  namespaced (e.g. `<namespace>/<name>`), so two integrations' `mfg` sets never clash.
+  (This differs from spaces, which key on `external_id` under `prov_roots`.)
 - **Created before actions.** Apply order is **resources → folders → ACL/metadata →
   actions**, so `${resource:...}` always resolves to an existing id when a binding is
   wired (§7).
@@ -516,7 +529,8 @@ admin UIs flag them as externally managed.
 Tenant-scoped resources (§5.8) are normally created *inline* via a blueprint's
 `resources` section on `POST /spaces`, but they also have a **standalone** API for
 managing tenant-level config not tied to a single space (idempotent by
-`(tenant, type, name)`, scoped by `prov_resources`):
+`(tenant, namespace, type, name)`, confined to the integration's `prov_namespace`
+prefix and gated by `prov_resources`):
 - `POST /v1/provisioning/resources` — create/reconcile a resource
   `{ tenant, type, name, body }` → `{ type, name, service_object_id, status }`.
 - `GET /v1/provisioning/resources?tenant=&type=` — list within scope.
@@ -766,10 +780,17 @@ the §14.7 provisioning surface.
    per-integration restriction; default is "any installed".
 7. **Tenant-scoped dependent resources** (§5.8) — resolved: provisioning creates them
    (classifier sets, notify templates) via an **extensible resource-handler registry**,
-   keyed `(tenant, type, name)`, referenced by `${resource:...}`, created before
-   actions. *Still open:* cross-integration **name-collision** policy (namespace names
-   per integration, e.g. a required prefix, vs first-writer-owns) and the exact
-   **ref-count / GC** policy when the last referencing space is deleted.
+   referenced by `${resource:...}`, created before actions.
+   - **Name-collision — resolved:** a **namespace prefix is bound to each integration
+     credential** at registration (§14.1) and carried as `prov_namespace` (§3.1).
+     Resource identity is `(tenant, namespace, type, name)`; the underlying object is
+     created `<prefix>/<name>`, so integrations never collide and each is confined to
+     its own namespace.
+   - **GC — resolved (default):** shared resources are **ref-counted** and removed only
+     by an **explicit** `DELETE /resources` (requires `ref_count`=0 unless `force`);
+     **no auto-GC** when a referencing space is deleted (a sibling space may still use
+     it). Provisioning may offer a later "prune orphaned (ref_count 0) namespace
+     resources" op, but does not auto-delete.
 
 ### 14a. Upstream dependency (frontend) — honor the `managed_by` metadata key
 Decision 5 is satisfied by a **frontend** convention, not a backend schema change:
