@@ -15,6 +15,7 @@ from . import schema
 class Store(Protocol):
     def ensure_tenant(self, tenant: str) -> None: ...
     def find_space(self, tenant: str, integration_id: str, external_id: str) -> Optional[dict]: ...
+    def list_spaces(self, tenant: str) -> list[dict]: ...
     def persist(self, tenant: str, req, result) -> dict: ...
     def get_space_by_uid(self, tenant: str, space_uid: str) -> Optional[dict]: ...
     def soft_delete_space(self, tenant: str, space_uid: str) -> bool: ...
@@ -56,6 +57,9 @@ class InMemoryStore:
 
     def find_space(self, tenant, integration_id, external_id):
         return self.spaces.get(self._key(tenant, integration_id, external_id))
+
+    def list_spaces(self, tenant):
+        return [dict(row) for key, row in self.spaces.items() if key[0] == tenant]
 
     def persist(self, tenant, req, result) -> dict:
         key = self._key(tenant, req.integration_id, req.external_id)
@@ -143,6 +147,16 @@ class PgStore:
             return None
         return {"id": r[0], "space_uid": r[1], "blueprint_name": r[2],
                 "version": r[3], "status": r[4]}
+
+    def list_spaces(self, tenant):
+        s = schema.schema_name(tenant)
+        with self._conn().cursor() as cur:
+            cur.execute(
+                f'SELECT space_uid, integration_id, external_id, blueprint_name, version, status '
+                f'FROM "{s}".provisioned_space')
+            rows = cur.fetchall()
+        return [{"space_uid": r[0], "integration_id": r[1], "external_id": r[2],
+                 "blueprint_name": r[3], "version": r[4], "status": r[5]} for r in rows]
 
     def persist(self, tenant, req, result) -> dict:
         s = schema.schema_name(tenant)

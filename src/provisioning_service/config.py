@@ -57,6 +57,8 @@ class Config:
         self.http_host = _env(e, "PROV_HTTP_HOST", "127.0.0.1")
         self.http_port = _int(e, "PROV_HTTP_PORT", 8100)
         self.cors_origins = _csv(e, "PROV_CORS_ORIGINS")
+        # Default tenants for the reconcile drift sweep when none are passed on the CLI.
+        self.reconcile_tenants = _env(e, "PROV_RECONCILE_TENANTS", "")
 
         # --- Postgres (own DB) ---
         self.pg_host = _env(e, "PROV_PG_HOST", "localhost")
