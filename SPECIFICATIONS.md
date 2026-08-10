@@ -76,7 +76,11 @@ but the session handshake needs none.
 
 ## 3. Authentication & acting identity
 
-Mirrors the lane's auth stack (`jwt_verify.py` + `bridge_auth.py` + `http_auth.py`):
+Mirrors the lane's auth stack (`jwt_verify.py` + `bridge_auth.py` + `http_auth.py`).
+The integration-service token this service consumes is minted from the integration's
+**one asymmetric keypair** — the *same* credential that authorizes session hand-off
+(embedding-kit §14); there are **no separate/symmetric service credentials** for
+provisioning. This service just verifies the resulting bridge JWT:
 
 - **Local HS256 verify** of the bearer against the shared `FILEENGINE_JWT_SECRET`
   (alg-pinned, `exp` enforced, roles map scoped by `X-Tenant`), with a **bridge
