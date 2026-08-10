@@ -152,6 +152,10 @@ embedding-kit §14.1) so this service enforces without reading the registry itse
   resource it creates with it (`<prefix>/<name>`) and confines the integration to its
   own namespace, so integrations never collide on a shared resource name. Authoritative
   (from the registry), not settable by the caller.
+- `aip: [ip|cidr, ..]` — the integration's **source-IP allow-list** (embedding-kit
+  §14.2a), stamped into the token by the exchange endpoint. This service **re-enforces**
+  it (§3.3): a valid token used from an off-list host is rejected, so a leaked token or a
+  compromised key still cannot reach provisioning from an unknown network.
 Every request is checked against these ceilings **before** any core call; the core
 ACL check is the second, authoritative gate.
 
@@ -185,6 +189,22 @@ structure in the shared LDAP directory** (`FILEENGINE_LDAP_TENANT_BASE`, e.g.
   materialization — no new tenant RPC required. If strict pre-materialization
   (schema/storage without a first write) is ever wanted, a small admin "ensure
   tenant" op could be added later; not needed for v1.
+
+### 3.3 Source-IP enforcement (defense-in-depth)
+On top of verifying the bridge JWT, this service **re-enforces the integration's
+source-IP allow-list** — a valid token used from an off-list host is rejected. This
+means that even a **compromised private key or a leaked token** cannot reach
+provisioning unless the caller is also on a whitelisted network (embedding-kit §14.2a).
+- **Source of the list:** the token's `aip` claim (§3.1), stamped by the exchange
+  endpoint from the registry `allowed_ips` — so this service needs no separate registry
+  read. (A deployment may also pin an allow-list in config as a backstop.)
+- **Trusted-proxy correctness:** the client IP is derived from `X-Forwarded-For` under a
+  **trusted-proxy** config (`PROV_TRUSTED_PROXIES`), matching the platform's audit
+  IP-derivation convention — the check uses the *derived* client IP, never the edge
+  proxy's. Enforced by a request middleware ahead of the route handlers.
+- **Reject + audit:** an off-list source is `403` and emits a `provisioning.*` rejection
+  (security signal); the server-to-server nature means the allow-list is stable
+  (the integration's backend egress IPs).
 
 ---
 
@@ -677,6 +697,10 @@ Service-private `PROV_*`:
 - Auth: `PROV_BRIDGE_URL` (+ `PROV_BRIDGE_INTROSPECT_TTL`) for the introspection
   fallback; `PROV_PROVISIONING_ROLE` (the role name used when acting as an
   integration principal on the core).
+- IP enforcement (§3.3): `PROV_TRUSTED_PROXIES` (CIDR list of edge proxies whose
+  `X-Forwarded-For` is trusted for client-IP derivation); `PROV_ENFORCE_AIP` (default
+  true — reject a token's request from outside its `aip` allow-list); optional
+  `PROV_IP_ALLOWLIST` deployment backstop.
 - Orchestration: `PROV_FOLDER_ACTIONS_URL` (:8099) + `PROV_FOLDER_ACTIONS_TIMEOUT_S`
   for applying per-space automation bindings (§7.1).
 - Limits: `PROV_MAX_TREE_NODES`, `PROV_MAX_TREE_DEPTH`, `PROV_APPLY_RATE_PER_MIN`
@@ -745,7 +769,9 @@ Console scripts (`pyproject`): `provisioning-service = provisioning_service.app:
   (create/reconcile/enforce, drift); scope enforcement (deny out-of-scope root/
   principal; reject a role not present in the tenant); idempotency (repeat
   `external_id` → same space).
-- **Auth:** integration-service vs admin token gating; introspection fallback.
+- **Auth:** integration-service vs admin token gating; introspection fallback;
+  **source-IP enforcement** (§3.3) — off-list source rejected `403`; trusted-proxy
+  `X-Forwarded-For` derivation (not the proxy IP); `aip` claim honored.
 - **Integration:** against a running dev stack (`scripts/start_backend_services.sh`)
   — apply a blueprint, assert the folder tree + ACLs + metadata + `managed`
   folder_actions bindings (`${node}` destinations resolved) in the core, re-apply
