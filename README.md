@@ -17,6 +17,11 @@ provisioning surface (§14.7 of `fileengine_commercial_integration_components`).
   identity authority (roles/membership stay in the shared LDAP), or a token minter.
 - **License:** AGPL-3.0-or-later. **Port:** `8100`. **Package:** `provisioning_service`.
 
+📘 **[Integration Guide](docs/INTEGRATION_GUIDE.md)** — the full developer guide: auth &
+scope claims, the blueprint document (params, tree, actions, resources, `${…}` tokens),
+applying/managing spaces, the §6.3 per-space setup API, tenant-scoped resources, the
+reconcile sweep, a worked example, deployment config, and an errors/endpoint reference.
+
 ## Status
 Specification stage. See **[SPECIFICATIONS.md](./SPECIFICATIONS.md)** for the full
 design: auth & acting identity, data model, template model, API surface, apply
