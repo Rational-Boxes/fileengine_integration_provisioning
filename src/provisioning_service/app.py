@@ -19,7 +19,7 @@ from .providers import Providers, default_providers
 
 log = logging.getLogger("provisioning_service")
 
-_MONITOR_PATHS = {"/healthz", "/readyz", "/poolz"}
+_MONITOR_PATHS = {"/healthz", "/readyz", "/poolz", "/metrics"}
 
 
 def create_app(config: Optional[Config] = None,
@@ -78,6 +78,10 @@ def create_app(config: Optional[Config] = None,
 def create_app_finalize(app: FastAPI) -> FastAPI:
     from .api import router as provisioning_router
     app.include_router(provisioning_router)
+    # Prometheus scrape endpoint, behind the same monitoring allowlist.
+    from . import metrics as _fe_metrics
+    _fe_metrics.install(app, "provisioning_service", [], {"version": "0.1.0"})
+
     return app
 
 
