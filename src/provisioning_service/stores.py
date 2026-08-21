@@ -6,6 +6,7 @@ testable against an in-memory fake. ``PgStore`` is the real psycopg implementati
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from . import schema
@@ -123,18 +124,34 @@ class PgStore:
     def __init__(self, config):
         self.config = config
         self._pool = None
+        # Guards both lazy inits below. Each was check-then-act: two concurrent
+        # requests could both find `_pool is None` and open a connection (one
+        # then leaks, unreferenced and never closed), and both could decide a
+        # tenant needed provisioning and run the same DDL.
+        self._lock = threading.Lock()
+        self._provisioned: set[str] = set()
 
     def _conn(self):
         import psycopg  # lazy
         if self._pool is None:
-            c = self.config
-            self._pool = psycopg.connect(
-                host=c.pg_host, port=c.pg_port, user=c.pg_user,
-                password=c.pg_password, dbname=c.pg_database, autocommit=False)
+            with self._lock:
+                if self._pool is None:
+                    c = self.config
+                    self._pool = psycopg.connect(
+                        host=c.pg_host, port=c.pg_port, user=c.pg_user,
+                        password=c.pg_password, dbname=c.pg_database, autocommit=False)
         return self._pool
 
     def ensure_tenant(self, tenant: str) -> None:
-        schema.ensure_tenant_schema(self._conn(), tenant)
+        """Idempotent, and now also memoised: this used to re-run the whole
+        tenant DDL on every provisioning request rather than once per tenant."""
+        if tenant in self._provisioned:
+            return
+        conn = self._conn()
+        with self._lock:
+            if tenant not in self._provisioned:
+                schema.ensure_tenant_schema(conn, tenant)
+                self._provisioned.add(tenant)
 
     def find_space(self, tenant, integration_id, external_id):
         s = schema.schema_name(tenant)

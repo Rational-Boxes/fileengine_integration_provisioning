@@ -102,11 +102,18 @@ def tenant_ddl(tenant: str) -> str:
     return _TENANT_DDL.format(schema=schema_name(tenant))
 
 
+_PROVISION_LOCK_CLASS = 0x0D15C
+
+
 def ensure_tenant_schema(conn, tenant: str) -> str:
     """Execute the tenant DDL on ``conn`` (a psycopg connection). Returns the
     schema name. Idempotent."""
     name = schema_name(tenant)
     with conn.cursor() as cur:
+        # Serialised across processes: idempotent DDL is not concurrency-safe
+        # DDL. Transaction-scoped, released by the commit below.
+        cur.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                    (_PROVISION_LOCK_CLASS, name))
         cur.execute(tenant_ddl(tenant))
     conn.commit()
     return name
